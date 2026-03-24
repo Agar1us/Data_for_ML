@@ -19,6 +19,16 @@ def _supported_kwargs(factory: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     return supported
 
 
+def _openai_token_kwargs(config: Any) -> dict[str, Any]:
+    max_tokens = getattr(config, "max_tokens", None)
+    if max_tokens is None:
+        return {}
+    model_id = str(getattr(config, "model_id", "") or "").strip().lower()
+    if model_id.startswith("gpt-5"):
+        return {"max_completion_tokens": max_tokens}
+    return {"max_tokens": max_tokens}
+
+
 def create_openai_model(config: Any) -> Any:
     from smolagents import OpenAIModel
 
@@ -27,7 +37,7 @@ def create_openai_model(config: Any) -> Any:
         {
             "model_id": getattr(config, "model_id", None),
             "temperature": getattr(config, "temperature", None),
-            "max_tokens": getattr(config, "max_tokens", None),
+            **_openai_token_kwargs(config),
         },
     )
     return OpenAIModel(**kwargs)

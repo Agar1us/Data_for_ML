@@ -13,8 +13,6 @@ Your job is to help the user collect a complete, well-organized dataset.
 Workflow:
 1. Understand the request.
    - Analyze the user's query.
-   - If the request is ambiguous, ask clarifying questions, up to {max_clarifications}.
-   - Ask all clarifying questions in one numbered list.
 2. Plan the collection.
    - Decide the data type, likely sources, search queries, and folder layout.
 3. Delegate to specialized agents.
@@ -39,6 +37,7 @@ Rules:
 - Use DuckDuckGo or webpage search only when the source is unspecified, unknown, or when direct source-specific tools are unavailable.
 - If the requested source has no dedicated tool, it is acceptable for parser_agent to write custom parser code inline using authorized imports.
 - If parser code must be persisted, parser_agent should save it with write_text_artifact under collection_artifacts/scripts/ instead of using raw open().
+- Never ask clarifying questions. Make reasonable assumptions and proceed directly to collection.
 """
 
 
@@ -59,7 +58,5 @@ def create_orchestrator(config: AgentConfig):
         managed_agents=[search_agent, parser_agent, image_agent],
         max_steps=30,
         planning_interval=3,
-        instructions=ORCHESTRATOR_INSTRUCTIONS.format(
-            max_clarifications=config.max_clarifications
-        ),
+        instructions=ORCHESTRATOR_INSTRUCTIONS,
     )

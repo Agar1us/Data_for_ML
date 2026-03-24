@@ -11,6 +11,7 @@ from data_quality_tools_agent.tools import (
     apply_cleaning_plan,
     compare_before_after,
     compute_correlations,
+    deduplicate_image_dataset,
     detect_all_issues,
     plot_distributions,
     plot_quality_dashboard,
@@ -25,11 +26,12 @@ from data_quality_tools_agent.tools import (
 )
 
 
-AGENT_INSTRUCTIONS = """You are ToolBasedDataQualityAgent, a compact tool-only orchestrator for tabular data quality work.
+AGENT_INSTRUCTIONS = """You are ToolBasedDataQualityAgent, a compact tool-only orchestrator for data quality work.
 
 Rules:
 - Use only the provided tools.
-- Work only with CSV and Parquet inputs.
+- For tabular tasks, work with CSV and Parquet inputs.
+- If the task is image classification or a folder-organized image dataset, use deduplicate_image_dataset.
 - Prefer the smallest number of tool calls that still gives a complete answer.
 - Avoid creating unnecessary intermediate files.
 - Save final artifacts under the prepared run directory.
@@ -91,6 +93,17 @@ Required behavior:
 """
 
 
+IMAGE_DEDUP_TASK = """Run image near-duplicate removal for input_dir.
+
+Required behavior:
+1. Prepare a run directory.
+2. Deduplicate the folder-organized image dataset with deduplicate_image_dataset.
+3. Save the deduplicated dataset under cleaned/image_deduped.
+4. Save JSON and CSV artifacts listing deduplication outcomes.
+5. Return final_answer with output_dir, report_path, duplicates_path, totals, and run_dir.
+"""
+
+
 DETECT_TOOLS = [
     validate_and_load_table,
     prepare_run_dir,
@@ -133,12 +146,17 @@ FULL_AUDIT_TOOLS = [
     render_quality_notebook,
 ]
 
+IMAGE_DEDUP_TOOLS = [
+    prepare_run_dir,
+    deduplicate_image_dataset,
+]
+
 
 class ToolBasedDataQualityAgent:
     def __init__(
         self,
         model_id: str = "gpt-5-mini",
-        artifacts_dir: str = "quality_tools_artifacts",
+        artifacts_dir: str = "data/current_run/quality",
         task_description: str | None = None,
     ) -> None:
         self.model_id = model_id
@@ -231,6 +249,33 @@ class ToolBasedDataQualityAgent:
         self._require_paths(result, ["report_path", "notebook_path", "decision_path"])
         return result
 
+    def deduplicate_images(
+        self,
+        input_dir: str,
+        output_dir: str | None = None,
+        hash_func_name: str = "phash",
+        hash_size: int = 16,
+        threshold: int = 8,
+        dry_run: bool = False,
+    ) -> dict:
+        result = self._run_agent(
+            task_name="image_dedup",
+            task=IMAGE_DEDUP_TASK,
+            additional_args={
+                "input_dir": input_dir,
+                "output_dir": output_dir or "",
+                "hash_func_name": hash_func_name,
+                "hash_size": int(hash_size),
+                "threshold": int(threshold),
+                "dry_run": bool(dry_run),
+                "artifacts_dir": str(self.artifacts_dir),
+                "task_description": self.task_description or "",
+            },
+            max_steps=8,
+        )
+        self._require_paths(result, ["output_dir", "report_path", "duplicates_path"])
+        return result
+
     @staticmethod
     def _tools_for_task(task_name: str) -> list:
         tool_map = {
@@ -238,6 +283,7 @@ class ToolBasedDataQualityAgent:
             "fix": FIX_TOOLS,
             "compare": COMPARE_TOOLS,
             "full_audit": FULL_AUDIT_TOOLS,
+            "image_dedup": IMAGE_DEDUP_TOOLS,
         }
         return tool_map[task_name]
 

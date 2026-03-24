@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -21,15 +22,62 @@ def setup_logging(config: AgentConfig, query: str) -> str:
     return str(log_dir)
 
 
+def _write_jsonl(path: str | Path, records: list[dict]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+def _memory_records(agent) -> list[dict]:
+    memory = getattr(agent, "memory", None)
+    if memory is None:
+        return []
+
+    records: list[dict] = []
+    system_prompt = getattr(getattr(memory, "system_prompt", None), "system_prompt", "")
+    if system_prompt:
+        records.append(
+            {
+                "record_type": "system_prompt",
+                "agent_name": getattr(agent, "name", None) or getattr(agent, "agent_name", type(agent).__name__),
+                "data": system_prompt,
+            }
+        )
+
+    if hasattr(memory, "get_full_steps"):
+        steps = memory.get_full_steps()
+    else:
+        raw_steps = getattr(memory, "steps", [])
+        steps = [getattr(step, "dict", lambda: {"data": str(step)})() for step in raw_steps]
+
+    for index, step in enumerate(steps):
+        records.append(
+            {
+                "record_type": "memory_step",
+                "step": index,
+                "agent_name": getattr(agent, "name", None) or getattr(agent, "agent_name", type(agent).__name__),
+                "data": step,
+            }
+        )
+    return records
+
+
 def save_agent_logs(agent, log_dir: str) -> None:
     """Persist the agent step log, when available."""
-    log_path = os.path.join(log_dir, "agent_log.jsonl")
-    logs = getattr(agent, "logs", [])
-    with open(log_path, "w", encoding="utf-8") as handle:
-        for index, step in enumerate(logs):
-            entry = {"step": index, "data": str(step)}
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"Logs saved to {log_path}")
+    log_root = Path(log_dir)
+    orchestrator_log_path = log_root / "agent_log.jsonl"
+    orchestrator_records = _memory_records(agent)
+    _write_jsonl(orchestrator_log_path, orchestrator_records)
+    print(f"Logs saved to {orchestrator_log_path}")
+
+    managed_agents = getattr(agent, "managed_agents", {}) or {}
+    for name, managed_agent in managed_agents.items():
+        managed_log_path = log_root / f"{name}_log.jsonl"
+        managed_records = _memory_records(managed_agent)
+        _write_jsonl(managed_log_path, managed_records)
+        print(f"Managed agent logs saved to {managed_log_path}")
 
 
 def ensure_dependencies() -> None:
@@ -51,34 +99,36 @@ def main() -> int:
     )
     parser.add_argument("query", type=str, help="Describe the dataset to collect.")
     parser.add_argument(
-        "--max-clarifications",
-        type=int,
-        default=5,
-        help="Maximum number of clarifying questions.",
-    )
-    parser.add_argument(
         "--max-results",
         type=int,
         default=10,
         help="Maximum search results per source.",
     )
     parser.add_argument(
-        "--no-clarify",
-        action="store_true",
-        help="Skip clarifying questions.",
-    )
-    parser.add_argument(
         "--data-dir",
         type=str,
-        default="data",
-        help="Directory for saved datasets, relative to the project root by default.",
+        default="data/current_run/collection",
+        help="Directory for saved datasets, relative to the repository root by default.",
+    )
+    parser.add_argument(
+        "--logs-dir",
+        type=str,
+        default="data/current_run/logs",
+        help="Directory for dataset-agent logs, relative to the repository root by default.",
+    )
+    parser.add_argument(
+        "--artifacts-dir",
+        type=str,
+        default="data/current_run/collection_artifacts",
+        help="Directory for dataset-agent helper artifacts, relative to the repository root by default.",
     )
     args = parser.parse_args()
 
     config = AgentConfig(
-        max_clarifications=0 if args.no_clarify else args.max_clarifications,
         max_search_results=args.max_results,
         data_dir=args.data_dir,
+        logs_dir=args.logs_dir,
+        artifacts_dir=args.artifacts_dir,
     )
 
     config.data_root.mkdir(parents=True, exist_ok=True)
@@ -87,6 +137,10 @@ def main() -> int:
     os.environ["DATASET_AGENT_DATA_DIR"] = str(config.data_root)
     os.environ["DATASET_AGENT_LOGS_DIR"] = str(config.logs_root)
     os.environ["DATASET_AGENT_ARTIFACTS_DIR"] = str(config.artifacts_root)
+    os.environ["DATASET_AGENT_YANDEX_HEADLESS"] = "1" if config.yandex_headless else "0"
+    os.environ["DATASET_AGENT_MANUAL_CAPTCHA_TIMEOUT"] = str(config.yandex_manual_captcha_timeout)
+    if config.yandex_profile_dir:
+        os.environ["DATASET_AGENT_CHROME_PROFILE_DIR"] = config.yandex_profile_dir
 
     try:
         ensure_dependencies()

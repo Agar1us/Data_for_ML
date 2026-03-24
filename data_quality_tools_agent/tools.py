@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import shutil
 from functools import lru_cache
 from importlib.util import find_spec
 from pathlib import Path
@@ -38,6 +39,8 @@ MAX_COLUMNS_IN_RESPONSE = 50
 MAX_TOP_VALUES = 10
 MAX_RARE_LABELS = 20
 MAX_SAMPLE_ROWS = 5
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".gif"}
+IMAGE_HASH_FUNCTIONS = {"phash", "dhash", "ahash", "whash"}
 
 
 def _safe_json(value: Any) -> Any:
@@ -583,6 +586,186 @@ def _save_report_content(content: str, output_path: str, report_format: str = ""
     else:
         output.write_text(content, encoding="utf-8")
     return str(output)
+
+
+def _ensure_image_hash_dependencies() -> tuple[Any, Any]:
+    if find_spec("PIL") is None:
+        raise ImportError("Pillow is required for image deduplication.")
+    if find_spec("imagehash") is None:
+        raise ImportError("imagehash is required for image deduplication.")
+    from PIL import Image
+    import imagehash
+
+    return Image, imagehash
+
+
+def _collect_images_by_class(input_dir: str) -> dict[str, list[Path]]:
+    root = Path(input_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Input image directory does not exist: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Input path must be a directory with one subfolder per class: {root}")
+
+    images_by_class: dict[str, list[Path]] = {}
+    for subdir in sorted(root.iterdir()):
+        if not subdir.is_dir():
+            continue
+        files = [path for path in sorted(subdir.iterdir()) if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS]
+        if files:
+            images_by_class[subdir.name] = files
+    return images_by_class
+
+
+def _compute_image_hashes(
+    image_paths: list[Path],
+    *,
+    hash_func_name: str = "phash",
+    hash_size: int = 16,
+) -> tuple[list[tuple[Path, Any]], list[dict[str, str]]]:
+    Image, imagehash = _ensure_image_hash_dependencies()
+    hash_func = getattr(imagehash, {"phash": "phash", "dhash": "dhash", "ahash": "average_hash", "whash": "whash"}[hash_func_name])
+    results: list[tuple[Path, Any]] = []
+    unreadable: list[dict[str, str]] = []
+
+    for img_path in image_paths:
+        try:
+            with Image.open(img_path) as img:
+                image_hash = hash_func(img.convert("RGB"), hash_size=hash_size)
+            results.append((img_path, image_hash))
+        except Exception as exc:
+            logger.warning("Failed to read image %s: %s", img_path, exc)
+            unreadable.append({"path": str(img_path), "error": str(exc)})
+
+    return results, unreadable
+
+
+def _find_unique_images(
+    hashed_images: list[tuple[Path, Any]],
+    *,
+    threshold: int = 8,
+) -> tuple[list[Path], list[Path]]:
+    unique: list[tuple[Path, Any]] = []
+    duplicates: list[Path] = []
+
+    for path, current_hash in hashed_images:
+        is_duplicate = False
+        for _, existing_hash in unique:
+            if (current_hash - existing_hash) <= threshold:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            duplicates.append(path)
+        else:
+            unique.append((path, current_hash))
+
+    return [path for path, _ in unique], duplicates
+
+
+def _copy_unique_images(unique_paths: list[Path], output_dir: Path, class_name: str) -> list[str]:
+    target_dir = output_dir / class_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied_paths: list[str] = []
+    for source_path in unique_paths:
+        destination = target_dir / source_path.name
+        counter = 1
+        while destination.exists():
+            destination = target_dir / f"{source_path.stem}_{counter}{source_path.suffix}"
+            counter += 1
+        shutil.copy2(source_path, destination)
+        copied_paths.append(str(destination))
+    return copied_paths
+
+
+def _deduplicate_image_dataset(
+    input_dir: str,
+    output_dir: str,
+    *,
+    hash_func_name: str = "phash",
+    hash_size: int = 16,
+    threshold: int = 8,
+    dry_run: bool = False,
+    report_output_path: str = "",
+    duplicates_output_path: str = "",
+) -> dict[str, Any]:
+    hash_func_name = hash_func_name.strip().lower()
+    if hash_func_name not in IMAGE_HASH_FUNCTIONS:
+        raise ValueError(
+            f"Unsupported image hash function '{hash_func_name}'. Allowed values: {sorted(IMAGE_HASH_FUNCTIONS)}"
+        )
+    if hash_size <= 0:
+        raise ValueError("hash_size must be positive.")
+    if threshold < 0:
+        raise ValueError("threshold must be non-negative.")
+
+    images_by_class = _collect_images_by_class(input_dir)
+    if not images_by_class:
+        raise ValueError(f"No class subdirectories with supported image files were found in: {input_dir}")
+
+    output_root = Path(output_dir)
+    report_rows: list[dict[str, Any]] = []
+    duplicate_rows: list[dict[str, Any]] = []
+    unreadable_rows: list[dict[str, Any]] = []
+    total_before = 0
+    total_after = 0
+    total_removed = 0
+
+    for class_name, image_paths in images_by_class.items():
+        hashed_images, unreadable = _compute_image_hashes(
+            image_paths,
+            hash_func_name=hash_func_name,
+            hash_size=hash_size,
+        )
+        unique_paths, duplicate_paths = _find_unique_images(hashed_images, threshold=threshold)
+        if not dry_run:
+            _copy_unique_images(unique_paths, output_root, class_name)
+
+        class_before = len(image_paths)
+        class_after = len(unique_paths)
+        class_removed = len(duplicate_paths)
+        total_before += class_before
+        total_after += class_after
+        total_removed += class_removed
+
+        report_rows.append(
+            {
+                "class": class_name,
+                "before": class_before,
+                "after": class_after,
+                "removed": class_removed,
+                "unreadable": len(unreadable),
+            }
+        )
+        duplicate_rows.extend(
+            {
+                "class": class_name,
+                "duplicate_path": str(path),
+                "filename": path.name,
+            }
+            for path in duplicate_paths
+        )
+        unreadable_rows.extend({"class": class_name, **item} for item in unreadable)
+
+    payload = {
+        "input_dir": str(Path(input_dir).resolve()),
+        "output_dir": str(output_root.resolve()),
+        "hash_function": hash_func_name,
+        "hash_size": int(hash_size),
+        "threshold": int(threshold),
+        "dry_run": bool(dry_run),
+        "class_reports": report_rows,
+        "duplicates": duplicate_rows,
+        "unreadable_files": unreadable_rows,
+        "total_before": int(total_before),
+        "total_after": int(total_after),
+        "total_removed": int(total_removed),
+        "duplicate_ratio": round(total_removed / max(total_before, 1), 6),
+    }
+    if report_output_path:
+        payload["report_output_path"] = _write_json_artifact(payload, report_output_path)
+    if duplicates_output_path:
+        duplicates_df = pd.DataFrame(duplicate_rows or [], columns=["class", "duplicate_path", "filename"])
+        payload["duplicates_output_path"] = _write_table(duplicates_df, duplicates_output_path)
+    return payload
 
 
 def _plot_single(output_path: Path, plot_fn, *args) -> str:
@@ -1259,5 +1442,56 @@ def prepare_run_dir(base_dir: str, run_label: str) -> str:
                 "summary_dir": str(run_dir / "summary"),
             }
         )
+    except Exception as exc:
+        return _json_error(str(exc))
+
+
+@tool
+def deduplicate_image_dataset(
+    input_dir: str,
+    output_dir: str,
+    hash_func_name: str = "phash",
+    hash_size: int = 16,
+    threshold: int = 8,
+    dry_run: bool = False,
+    report_output_path: str = "",
+    duplicates_output_path: str = "",
+) -> str:
+    """
+    Remove near-duplicate images inside a folder-organized classification dataset.
+
+    Args:
+        input_dir: Root folder containing one subdirectory per class.
+        output_dir: Output folder where unique images will be copied.
+        hash_func_name: Image hash method: phash, dhash, ahash, or whash.
+        hash_size: Hash resolution passed to imagehash.
+        threshold: Maximum Hamming distance treated as a duplicate.
+        dry_run: If True, only compute the report without copying images.
+        report_output_path: Optional JSON report artifact path.
+        duplicates_output_path: Optional CSV path listing removed duplicates.
+
+    Returns:
+        JSON with per-class and total deduplication statistics plus artifact paths.
+    """
+    logger.info(
+        "deduplicate_image_dataset called: input=%s output=%s hash=%s threshold=%s dry_run=%s",
+        input_dir,
+        output_dir,
+        hash_func_name,
+        threshold,
+        dry_run,
+    )
+    try:
+        payload = _deduplicate_image_dataset(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            hash_func_name=hash_func_name,
+            hash_size=hash_size,
+            threshold=threshold,
+            dry_run=dry_run,
+            report_output_path=report_output_path,
+            duplicates_output_path=duplicates_output_path,
+        )
+        return _json_success(payload)
     except Exception as exc:
         return _json_error(str(exc))
