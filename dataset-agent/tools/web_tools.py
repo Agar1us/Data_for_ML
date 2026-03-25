@@ -8,29 +8,18 @@ from urllib.parse import urljoin
 
 import requests
 from smolagents import tool
+from tools.path_utils import data_root, resolve_data_output_path
 
 
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DatasetBot/1.0)"}
 
 
 def _data_root() -> str:
-    return os.getenv("DATASET_AGENT_DATA_DIR", "data")
+    return str(data_root())
 
 
 def _resolve_output_path(path: str) -> str:
-    if os.path.isabs(path):
-        return path
-
-    normalized = os.path.normpath(path)
-    data_root = _data_root()
-    data_dir_name = os.path.basename(os.path.normpath(data_root))
-
-    if normalized == data_dir_name:
-        normalized = ""
-    elif normalized.startswith(f"{data_dir_name}{os.sep}"):
-        normalized = normalized[len(data_dir_name) + 1 :]
-
-    return os.path.join(data_root, normalized) if normalized else data_root
+    return resolve_data_output_path(path)
 
 
 def _get(url: str, *, stream: bool = False) -> requests.Response:

@@ -21,10 +21,20 @@ Workflow:
    - image_agent: download images from Yandex Images.
 4. Report the result.
    - Summarize what was collected, where it was saved, and any gaps.
+   - Stop after dataset collection artifacts are produced.
 
 Rules:
 - Use only the provided tools and managed agents for downloads, parsing, and saving whenever a suitable tool already exists.
-- Always keep source outputs in separate subdirectories under data/<dataset_name>/.
+- Always keep source outputs under the configured collection root, not under ad-hoc top-level paths.
+- Treat any path like data/<dataset_name>/... from the user or your own plan as a logical dataset name under the configured collection root.
+- For image classification datasets, preserve one subdirectory per class under the dataset root.
+- Dataset-agent scope ends at collection artifacts: raw downloaded files, source metadata, and a concise collection summary.
+- Do not perform downstream pipeline stages inside dataset-agent: no local postprocessing scripts, no deduplication, no cleaning, no annotation, no train/val/test split generation, and no requests for confirmation about those later stages.
+- Do not ask the user to approve or confirm a "next step" once collection is complete; return the collected dataset state directly.
+- For folder-based image classification datasets, return one generic object prompt for downstream localization in simple English, for example "dog", "bird", "car", "flower", "swan".
+- Do not return class labels as object prompts. Object prompts must be common-object labels, not taxonomy labels.
+- Prefer one collection dataset root for the run and keep all collected class folders under that root.
+- If the source is already specified and directly supported, do not delegate to unrelated agents for optional research or postprocessing.
 - Save metadata for each collected source when enough information is available.
 - Skip irrelevant sources and explain why.
 - Prefer Hugging Face and Kaggle over raw web scraping when possible.
@@ -38,6 +48,14 @@ Rules:
 - If the requested source has no dedicated tool, it is acceptable for parser_agent to write custom parser code inline using authorized imports.
 - If parser code must be persisted, parser_agent should save it with write_text_artifact under collection_artifacts/scripts/ instead of using raw open().
 - Never ask clarifying questions. Make reasonable assumptions and proceed directly to collection.
+- Final answers must be short machine-readable summaries that include:
+  - dataset_root
+  - source
+  - class_dirs or class_labels
+  - object_prompts
+  - raw_counts when known
+  - metadata_paths
+  - gaps_or_limitations
 """
 
 

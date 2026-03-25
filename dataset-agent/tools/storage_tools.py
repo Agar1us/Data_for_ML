@@ -40,20 +40,21 @@ def save_dataset(data: str, dataset_name: str, filename: str) -> str:
 @tool
 def save_metadata(dataset_name: str, metadata_json: str) -> str:
     """
-    Save metadata JSON to data/<dataset_name>/metadata.json.
+    Save metadata JSON to data/metadata.json.
 
     Args:
-        dataset_name: Name of the dataset subdirectory.
+        dataset_name: Dataset name for provenance only.
         metadata_json: Metadata payload encoded as a JSON string.
 
     Returns:
         A status string with the saved metadata path.
     """
-    dir_path = os.path.join(_data_root(), dataset_name)
+    dir_path = _data_root()
     os.makedirs(dir_path, exist_ok=True)
     file_path = os.path.join(dir_path, "metadata.json")
 
     metadata = json.loads(metadata_json)
+    metadata["dataset_name"] = dataset_name
     metadata["saved_at"] = datetime.now(timezone.utc).isoformat()
 
     with open(file_path, "w", encoding="utf-8") as handle:

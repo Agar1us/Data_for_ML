@@ -4,12 +4,11 @@ import json
 import logging
 import math
 import re
-import os
-import shutil
 import threading
 import warnings
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
@@ -22,28 +21,33 @@ except ImportError:  # pragma: no cover - import fallback for static analysis en
         return func
 
 from annotation_agent.config import (
+    AL_HUMAN_LABELS_FILE_NAME,
+    AL_LABELS_COLUMNS,
+    AL_LABELS_FILE_NAME,
     COLUMN_ALL_DETECTIONS_JSON,
     COLUMN_BBOX_XYXY,
-    COLUMN_CONFIDENCE,
     COLUMN_FILE_PATH,
     COLUMN_FILENAME,
     COLUMN_FOLDER_LABEL,
-    COLUMN_FOLDER_MATCH,
     COLUMN_HAS_MASK,
     COLUMN_IMAGE_HEIGHT,
     COLUMN_IMAGE_WIDTH,
+    COLUMN_LABEL_SOURCE,
     COLUMN_MASK_PATH,
-    COLUMN_PREDICTED_LABEL,
+    COLUMN_OBJECT_CONFIDENCE,
+    COLUMN_OBJECT_DETECTED,
+    COLUMN_OBJECT_LABEL,
     DEFAULT_BOUNDARY_CONFIDENCE_RANGE,
     DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_LABEL_ASSIGNMENT_MODE,
     DEFAULT_MODEL_PATH,
-    DEFAULT_REVIEW_LINK_MODE,
+    DEFAULT_TASK_MODE,
     NO_DETECTION_LABEL,
     SUPPORTED_IMG_EXTENSIONS,
     ToolResult,
 )
 from annotation_agent.models import AnnotationSpec, Detection, QualityMetrics
-from annotation_agent.reporting import ensure_run_layout, make_run_id
+from annotation_agent.reporting import ensure_run_layout
 
 
 logger = logging.getLogger(__name__)
@@ -208,6 +212,200 @@ def _validate_image(path: str) -> str | None:
         return str(exc)
 
 
+def _resolve_labelstudio_image_path(image_reference: str, local_files_document_root: str = "") -> str:
+    reference = str(image_reference or "").strip()
+    if not reference:
+        raise ValueError("Label Studio export row is missing the 'image' field.")
+    marker = "/data/local-files/?d="
+    if reference.startswith(marker):
+        relative_path = unquote(reference[len(marker):])
+        candidate = Path(relative_path)
+        if candidate.is_absolute():
+            return str(candidate.resolve())
+        root = Path(local_files_document_root).resolve() if local_files_document_root else Path.cwd().resolve()
+        return str((root / candidate).resolve())
+    candidate = Path(unquote(reference))
+    if candidate.is_absolute():
+        return str(candidate.resolve())
+    root = Path(local_files_document_root).resolve() if local_files_document_root else Path.cwd().resolve()
+    return str((root / candidate).resolve())
+
+
+def _parse_labelstudio_rectangles(payload: Any) -> list[dict[str, Any]]:
+    if payload is None or payload == "":
+        return []
+    parsed = payload
+    if isinstance(payload, str):
+        parsed = json.loads(payload)
+    if not isinstance(parsed, list):
+        return []
+    rectangles: list[dict[str, Any]] = []
+    for item in parsed:
+        if isinstance(item, dict):
+            rectangles.append(item)
+    return rectangles
+
+
+def _label_from_rectangles(rectangles: list[dict[str, Any]]) -> str:
+    for item in rectangles:
+        labels = item.get("rectanglelabels")
+        if isinstance(labels, list) and labels:
+            label = str(labels[0]).strip()
+            if label:
+                return label
+    return ""
+
+
+def _rectangle_to_xyxy(item: dict[str, Any]) -> tuple[list[float], int, int]:
+    original_width = int(round(float(item.get("original_width", 0) or 0)))
+    original_height = int(round(float(item.get("original_height", 0) or 0)))
+    if original_width <= 0 or original_height <= 0:
+        raise ValueError("Label Studio rectangle is missing original image dimensions.")
+    x = float(item.get("x", 0.0) or 0.0)
+    y = float(item.get("y", 0.0) or 0.0)
+    width = float(item.get("width", 0.0) or 0.0)
+    height = float(item.get("height", 0.0) or 0.0)
+    x1 = (x / 100.0) * original_width
+    y1 = (y / 100.0) * original_height
+    x2 = ((x + width) / 100.0) * original_width
+    y2 = ((y + height) / 100.0) * original_height
+    return [float(x1), float(y1), float(x2), float(y2)], original_width, original_height
+
+
+def _select_primary_bbox(detections: list[dict[str, Any]]) -> list[float] | None:
+    if not detections:
+        return None
+
+    def area(item: dict[str, Any]) -> float:
+        bbox = item.get("bbox", [])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return -1.0
+        return max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+
+    best = max(detections, key=area)
+    bbox = best.get("bbox", [])
+    return [float(value) for value in bbox] if isinstance(bbox, list) and len(bbox) == 4 else None
+
+
+def _needs_manual_review(row: pd.Series, confidence_threshold: float) -> bool:
+    confidence = float(row.get(COLUMN_OBJECT_CONFIDENCE, 0.0) or 0.0)
+    object_detected = _bool_from_value(row.get(COLUMN_OBJECT_DETECTED, False))
+    object_label = str(row.get(COLUMN_OBJECT_LABEL) or "").strip()
+    return (not object_detected) or object_label == NO_DETECTION_LABEL or confidence < float(confidence_threshold)
+
+
+def _build_object_level_labels_dataframe(
+    df: pd.DataFrame,
+    *,
+    is_human_verified: bool,
+    default_split: str,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        file_path = str(row.get(COLUMN_FILE_PATH) or "").strip()
+        if not file_path:
+            continue
+        filename = str(row.get(COLUMN_FILENAME) or Path(file_path).name)
+        image_width = int(float(row.get(COLUMN_IMAGE_WIDTH) or 0) or 0)
+        image_height = int(float(row.get(COLUMN_IMAGE_HEIGHT) or 0) or 0)
+        if image_width <= 0 or image_height <= 0:
+            image_width, image_height = _open_image_size(file_path)
+        class_label = str(row.get(COLUMN_FOLDER_LABEL) or "").strip()
+        detections = _parse_detection_list(row.get(COLUMN_ALL_DETECTIONS_JSON))
+        if not detections:
+            fallback_bbox = _normalize_bbox_json(row.get(COLUMN_BBOX_XYXY))
+            if len(fallback_bbox) == 4 and _bool_from_value(row.get(COLUMN_OBJECT_DETECTED, False)):
+                detections = [{"bbox": fallback_bbox}]
+        split = default_split
+        if not is_human_verified:
+            split = "review" if _needs_manual_review(row, confidence_threshold) else default_split
+        for detection in detections:
+            bbox = detection.get("bbox", [])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            rows.append(
+                {
+                    "file_path": str(Path(file_path).resolve()),
+                    "image_width": int(image_width),
+                    "image_height": int(image_height),
+                    "class_label": class_label,
+                    "x1": float(bbox[0]),
+                    "y1": float(bbox[1]),
+                    "x2": float(bbox[2]),
+                    "y2": float(bbox[3]),
+                    "is_human_verified": bool(is_human_verified),
+                    "split": split,
+                }
+            )
+    return pd.DataFrame(rows, columns=AL_LABELS_COLUMNS)
+
+
+def build_object_labels_impl(
+    input_path: str,
+    output_path: str,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+) -> ToolResult:
+    df = _read_table(input_path)
+    labels_df = _build_object_level_labels_dataframe(
+        df,
+        is_human_verified=False,
+        default_split="labeled",
+        confidence_threshold=float(confidence_threshold),
+    )
+    saved_path = _write_table(labels_df, output_path)
+    return {
+        "input_path": str(Path(input_path).resolve()),
+        "output_path": saved_path,
+        "rows": int(len(labels_df)),
+        "confidence_threshold": float(confidence_threshold),
+    }
+
+
+def convert_labelstudio_export_to_object_labels_impl(
+    export_path: str,
+    output_path: str,
+    local_files_document_root: str = "",
+) -> ToolResult:
+    export_df = _read_table(export_path)
+    required_columns = {"image", "label"}
+    missing = sorted(required_columns - set(export_df.columns))
+    if missing:
+        raise ValueError(f"Label Studio CSV export is missing required columns: {missing}")
+
+    rows: list[dict[str, Any]] = []
+    for _, row in export_df.iterrows():
+        file_path = _resolve_labelstudio_image_path(str(row.get("image") or ""), local_files_document_root=local_files_document_root)
+        rectangles = _parse_labelstudio_rectangles(row.get("label"))
+        for rectangle in rectangles:
+            bbox_xyxy, width, height = _rectangle_to_xyxy(rectangle)
+            class_label = _label_from_rectangles([rectangle])
+            if not class_label:
+                continue
+            rows.append(
+                {
+                    "file_path": str(Path(file_path).resolve()),
+                    "image_width": int(width),
+                    "image_height": int(height),
+                    "class_label": class_label,
+                    "x1": float(bbox_xyxy[0]),
+                    "y1": float(bbox_xyxy[1]),
+                    "x2": float(bbox_xyxy[2]),
+                    "y2": float(bbox_xyxy[3]),
+                    "is_human_verified": True,
+                    "split": "human_review",
+                }
+            )
+    labels_df = pd.DataFrame(rows, columns=AL_LABELS_COLUMNS)
+    saved_path = _write_table(labels_df, output_path)
+    return {
+        "export_path": str(Path(export_path).resolve()),
+        "output_path": saved_path,
+        "rows": int(len(labels_df)),
+        "local_files_document_root": str(Path(local_files_document_root).resolve()) if local_files_document_root else str(Path.cwd().resolve()),
+    }
+
+
 def _load_yoloe(model_path: str):
     with _MODEL_CACHE_LOCK:
         if model_path in _MODEL_CACHE:
@@ -309,17 +507,19 @@ def _bool_from_value(value: Any) -> bool:
 
 
 def _guess_label_column(df: pd.DataFrame) -> str:
-    for candidate in ("human_label", "label", "annotated_label", "predicted_label"):
+    for candidate in ("human_label", "label", "annotated_label", "folder_label", "predicted_label"):
         if candidate in df.columns:
             return candidate
-    raise ValueError("Human labels file must contain one of: human_label, label, annotated_label, predicted_label.")
+    raise ValueError(
+        "Human labels file must contain one of: human_label, label, annotated_label, folder_label, predicted_label."
+    )
 
 
 def _class_definitions(classes: list[str]) -> dict[str, str]:
     return {
         label: (
-            f"Assign '{label}' when the primary visible subject is best described as "
-            f"'{label.replace('_', ' ').replace('-', ' ')}' and this category is more specific than the alternatives."
+            f"Assign '{label}' when the full image should be categorized under "
+            f"'{label.replace('_', ' ').replace('-', ' ')}' according to the dataset taxonomy."
         )
         for label in classes
     }
@@ -351,26 +551,15 @@ def _save_mask_array(mask: np.ndarray, masks_dir: str, filename: str, row_index:
     return str(mask_path)
 
 
-def _persist_review_pointer(source: Path, target: Path, link_mode: str) -> None:
-    if link_mode == "manifest_only":
-        return
-    if link_mode == "symlink":
-        try:
-            if target.exists() or target.is_symlink():
-                target.unlink()
-            os.symlink(source, target)
-            return
-        except OSError:
-            logger.warning("Failed to create symlink %s -> %s, falling back to copy2.", target, source, exc_info=True)
-    shutil.copy2(source, target)
-
-
 def _render_spec_markdown(spec: AnnotationSpec) -> str:
     lines = [
         f"# Annotation Specification: {spec.task_name}",
         "",
         "## Task Description",
         spec.task_description,
+        "",
+        "Object prompts used for localization/segmentation:",
+        ", ".join(f"`{prompt}`" for prompt in spec.object_prompts) if spec.object_prompts else "No explicit object prompts provided.",
         "",
         "## Classes",
     ]
@@ -383,12 +572,18 @@ def _render_spec_markdown(spec: AnnotationSpec) -> str:
             for index, example in enumerate(examples, start=1):
                 lines.append(f"{index}. `{example}`")
         lines.append("")
-    lines.extend(["## Edge Cases", "| File | Reason | Prediction | Folder |", "| --- | --- | --- | --- |"])
+    lines.extend(["## Edge Cases"])
+    if spec.edge_case_counts:
+        lines.extend(["Edge case counts by reason:"])
+        for reason, count in sorted(spec.edge_case_counts.items()):
+            lines.append(f"- `{reason}`: {count}")
+        lines.append("")
+    lines.extend(["| File | Reason | Object Label | Class |", "| --- | --- | --- | --- |"])
     if spec.edge_cases:
         for item in spec.edge_cases:
             lines.append(
                 f"| `{item.get('file_path', '')}` | {item.get('reason', '')} | "
-                f"{item.get('predicted_label', '')} | {item.get('folder_label', '')} |"
+                f"{item.get('object_label', '')} | {item.get('folder_label', '')} |"
             )
     else:
         lines.append("| None | No edge cases detected | | |")
@@ -396,28 +591,95 @@ def _render_spec_markdown(spec: AnnotationSpec) -> str:
     return "\n".join(lines)
 
 
+def _edge_case_reason_tokens(reason_value: Any) -> list[str]:
+    text = str(reason_value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _compact_edge_cases(edge_cases: list[dict[str, Any]], max_total: int = 12, max_per_reason: int = 4, max_per_class_reason: int = 2) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    reason_counts: dict[str, int] = {}
+    for item in edge_cases:
+        for reason in _edge_case_reason_tokens(item.get("reason")):
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    if len(edge_cases) <= max_total:
+        return edge_cases, reason_counts
+
+    sampled: list[dict[str, Any]] = []
+    per_reason_used: dict[str, int] = {}
+    per_class_reason_used: dict[tuple[str, str], int] = {}
+    seen_files: set[str] = set()
+    priority_reasons = ("no_detection", "multiple_detections", "boundary_confidence")
+
+    def _try_add(item: dict[str, Any], reason: str) -> bool:
+        file_path = str(item.get(COLUMN_FILE_PATH) or "")
+        class_label = str(item.get(COLUMN_FOLDER_LABEL) or "")
+        key = (reason, class_label)
+        if file_path in seen_files:
+            return False
+        if per_reason_used.get(reason, 0) >= max_per_reason:
+            return False
+        if per_class_reason_used.get(key, 0) >= max_per_class_reason:
+            return False
+        sampled.append(item)
+        seen_files.add(file_path)
+        per_reason_used[reason] = per_reason_used.get(reason, 0) + 1
+        per_class_reason_used[key] = per_class_reason_used.get(key, 0) + 1
+        return True
+
+    for reason in priority_reasons:
+        for item in edge_cases:
+            if len(sampled) >= max_total:
+                break
+            if reason in _edge_case_reason_tokens(item.get("reason")):
+                _try_add(item, reason)
+
+    for item in edge_cases:
+        if len(sampled) >= max_total:
+            break
+        reasons = _edge_case_reason_tokens(item.get("reason"))
+        if not reasons:
+            continue
+        for reason in reasons:
+            if _try_add(item, reason):
+                break
+
+    return sampled, reason_counts
+
+
 def _quality_payload(df: pd.DataFrame, confidence_threshold: float) -> QualityMetrics:
-    predicted = (
-        df[COLUMN_PREDICTED_LABEL].fillna("").astype(str).replace("", NO_DETECTION_LABEL).value_counts().to_dict()
-        if COLUMN_PREDICTED_LABEL in df.columns
+    assigned = (
+        df[COLUMN_FOLDER_LABEL].fillna("").astype(str).replace("", NO_DETECTION_LABEL).value_counts().to_dict()
+        if COLUMN_FOLDER_LABEL in df.columns
         else {}
     )
-    confidence_series = pd.to_numeric(df.get(COLUMN_CONFIDENCE, pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-    folder_match_series = (
-        df.get(COLUMN_FOLDER_MATCH, pd.Series(dtype=bool)).map(_bool_from_value)
-        if COLUMN_FOLDER_MATCH in df.columns
+    confidence_series = pd.to_numeric(df.get(COLUMN_OBJECT_CONFIDENCE, pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    object_detected_series = (
+        df.get(COLUMN_OBJECT_DETECTED, pd.Series(dtype=bool)).map(_bool_from_value)
+        if COLUMN_OBJECT_DETECTED in df.columns
+        else pd.Series(dtype=bool)
+    )
+    has_mask_series = (
+        df.get(COLUMN_HAS_MASK, pd.Series(dtype=bool)).map(_bool_from_value)
+        if COLUMN_HAS_MASK in df.columns
         else pd.Series(dtype=bool)
     )
     low_conf_mask = confidence_series < float(confidence_threshold)
+    no_detection_count = int((~object_detected_series).sum()) if not object_detected_series.empty else 0
     metrics = QualityMetrics(
         kappa=None,
         percent_agreement=None,
-        label_distribution={str(key): int(value) for key, value in predicted.items()},
-        folder_match_rate=float(folder_match_series.mean()) if not folder_match_series.empty else 0.0,
-        confidence_mean=float(confidence_series.mean()) if not confidence_series.empty else 0.0,
-        confidence_std=float(confidence_series.std(ddof=0)) if len(confidence_series) > 1 else 0.0,
+        label_distribution={str(key): int(value) for key, value in assigned.items()},
+        object_detection_rate=float(object_detected_series.mean()) if not object_detected_series.empty else 0.0,
+        mask_rate=float(has_mask_series.mean()) if not has_mask_series.empty else 0.0,
+        object_confidence_mean=float(confidence_series.mean()) if not confidence_series.empty else 0.0,
+        object_confidence_std=float(confidence_series.std(ddof=0)) if len(confidence_series) > 1 else 0.0,
         low_confidence_count=int(low_conf_mask.sum()),
         low_confidence_ratio=float(low_conf_mask.mean()) if len(confidence_series) else 0.0,
+        no_detection_count=no_detection_count,
+        no_detection_ratio=float(no_detection_count / len(df)) if len(df) else 0.0,
         confusion_matrix=None,
     )
     return metrics
@@ -453,14 +715,15 @@ def _compute_agreement(df_auto: pd.DataFrame, df_human: pd.DataFrame, confidence
     if merged.empty:
         raise ValueError("No overlapping filenames between auto labels and human labels.")
 
-    auto_labels = merged[COLUMN_PREDICTED_LABEL].fillna("").astype(str)
+    auto_label_column = COLUMN_FOLDER_LABEL
+    auto_labels = merged[auto_label_column].fillna("").astype(str)
     human_labels = merged["human_label"].fillna("").astype(str)
     non_empty = (auto_labels != "") & (human_labels != "")
     merged = merged.loc[non_empty].reset_index(drop=True)
     if merged.empty:
         raise ValueError("Overlapping rows exist, but at least one side has only empty labels.")
 
-    labels = sorted(set(merged[COLUMN_PREDICTED_LABEL]).union(set(merged["human_label"])))
+    labels = sorted(set(merged[auto_label_column]).union(set(merged["human_label"])))
     if len(labels) < 2:
         raise ValueError("Need at least two distinct labels across auto and human annotations to compute Cohen's kappa.")
 
@@ -469,7 +732,7 @@ def _compute_agreement(df_auto: pd.DataFrame, df_human: pd.DataFrame, confidence
     except ImportError as exc:
         raise ImportError("scikit-learn is required to compute agreement metrics with human labels.") from exc
 
-    matrix = confusion_matrix(merged["human_label"], merged[COLUMN_PREDICTED_LABEL], labels=labels)
+    matrix = confusion_matrix(merged["human_label"], merged[auto_label_column], labels=labels)
     confusion_payload = {
         human_label: {pred_label: int(matrix[row_index, col_index]) for col_index, pred_label in enumerate(labels)}
         for row_index, human_label in enumerate(labels)
@@ -477,11 +740,12 @@ def _compute_agreement(df_auto: pd.DataFrame, df_human: pd.DataFrame, confidence
     base_metrics = _quality_payload(df_auto, confidence_threshold).to_dict()
     base_metrics.update(
         {
-            "kappa": float(cohen_kappa_score(merged["human_label"], merged[COLUMN_PREDICTED_LABEL], labels=labels)),
-            "percent_agreement": float((merged["human_label"] == merged[COLUMN_PREDICTED_LABEL]).mean()),
+            "kappa": float(cohen_kappa_score(merged["human_label"], merged[auto_label_column], labels=labels)),
+            "percent_agreement": float((merged["human_label"] == merged[auto_label_column]).mean()),
             "confusion_matrix": confusion_payload,
             "agreement_rows": int(len(merged)),
             "human_label_column": label_column,
+            "auto_label_column": auto_label_column,
         }
     )
     return base_metrics
@@ -506,11 +770,27 @@ def _bbox_to_labelstudio(bbox: list[float], image_width: int, image_height: int)
     }
 
 
+def _labelstudio_image_reference(file_path: str, base_image_url: str, local_files_document_root: str = "") -> str:
+    if not base_image_url:
+        return str(file_path)
+    if base_image_url.startswith("/data/local-files/?d="):
+        document_root = Path(local_files_document_root).resolve() if local_files_document_root else Path.cwd().resolve()
+        try:
+            relative_path = Path(file_path).resolve().relative_to(document_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"File path '{file_path}' is not inside Label Studio local files document root '{document_root}'."
+            ) from exc
+        return f"{base_image_url}{relative_path.as_posix()}"
+    return f"{base_image_url}{file_path}"
+
+
 def _labelstudio_record(row: pd.Series, image_reference: str, model_version: str) -> ToolResult:
-    predicted_label = str(row.get(COLUMN_PREDICTED_LABEL) or "").strip()
+    assigned_label = str(row.get(COLUMN_FOLDER_LABEL) or "").strip()
+    object_detected = _bool_from_value(row.get(COLUMN_OBJECT_DETECTED, False))
     bbox = _normalize_bbox_json(row.get(COLUMN_BBOX_XYXY))
     predictions: list[dict[str, Any]] = []
-    if predicted_label and predicted_label != NO_DETECTION_LABEL and len(bbox) == 4:
+    if assigned_label and object_detected and len(bbox) == 4:
         width = int(row.get(COLUMN_IMAGE_WIDTH) or 0)
         height = int(row.get(COLUMN_IMAGE_HEIGHT) or 0)
         if width <= 0 or height <= 0:
@@ -526,9 +806,9 @@ def _labelstudio_record(row: pd.Series, image_reference: str, model_version: str
                         "to_name": "image",
                         "value": {
                             **_bbox_to_labelstudio(bbox, width, height),
-                            "rectanglelabels": [predicted_label],
+                            "rectanglelabels": [assigned_label],
                         },
-                        "score": float(row.get(COLUMN_CONFIDENCE, 0.0) or 0.0),
+                        "score": float(row.get(COLUMN_OBJECT_CONFIDENCE, 0.0) or 0.0),
                     }
                 ],
             }
@@ -539,18 +819,12 @@ def _labelstudio_record(row: pd.Series, image_reference: str, model_version: str
     }
 
 
-def prepare_run_dir_impl(artifacts_dir: str, dataset_name: str = "", run_id: str = "") -> ToolResult:
-    prefix = _slugify(dataset_name) if dataset_name else "annotation"
-    final_run_id = run_id or make_run_id(prefix)
-    run_dir = ensure_run_layout(Path(artifacts_dir) / final_run_id)
+def prepare_run_dir_impl(artifacts_dir: str) -> ToolResult:
+    run_dir = ensure_run_layout(Path(artifacts_dir))
     return {
-        "run_id": final_run_id,
         "run_dir": str(run_dir),
         "reports_dir": str(run_dir / "reports"),
         "summary_dir": str(run_dir / "summary"),
-        "labeled_dir": str(run_dir / "cleaned_or_labeled"),
-        "manual_review_dir": str(run_dir / "manual_review"),
-        "masks_dir": str(run_dir / "masks"),
     }
 
 
@@ -608,15 +882,21 @@ def inspect_image_dataset_impl(dataset_dir: str, dataset_output_path: str = "", 
 
 def run_yoloe_labeling_impl(
     dataset_csv_path: str,
-    classes: list[str],
+    object_prompts: list[str],
     output_path: str,
     model_path: str = DEFAULT_MODEL_PATH,
     masks_dir: str = "",
     batch_size: int = 16,
     report_output_path: str = "",
+    task_mode: str = DEFAULT_TASK_MODE,
+    label_assignment_mode: str = DEFAULT_LABEL_ASSIGNMENT_MODE,
 ) -> dict[str, Any]:
-    if not classes:
-        raise ValueError("classes must be a non-empty list of class names.")
+    if not object_prompts:
+        raise ValueError("object_prompts must be a non-empty list of prompts.")
+    if task_mode != DEFAULT_TASK_MODE:
+        raise ValueError(f"Unsupported task_mode: {task_mode}")
+    if label_assignment_mode != DEFAULT_LABEL_ASSIGNMENT_MODE:
+        raise ValueError(f"Unsupported label_assignment_mode: {label_assignment_mode}")
     dataset_df = _read_table(dataset_csv_path)
     if dataset_df.empty:
         raise ValueError("Dataset manifest is empty; nothing to label.")
@@ -624,7 +904,7 @@ def run_yoloe_labeling_impl(
     model = _load_yoloe(model_path)
     if not hasattr(model, "set_classes"):
         raise AttributeError("Loaded YOLOE model does not expose set_classes().")
-    model.set_classes(classes)
+    model.set_classes(object_prompts)
 
     results_rows: list[dict[str, Any]] = []
     batch_size = max(1, int(batch_size))
@@ -637,9 +917,9 @@ def run_yoloe_labeling_impl(
         for local_index, prediction in enumerate(predictions):
             row_index = batch_start + local_index
             source_row = dataset_df.iloc[row_index]
-            detections, batch_masks = _extract_detections(prediction, classes, mask_key_prefix=f"row_{row_index}_")
+            detections, batch_masks = _extract_detections(prediction, object_prompts, mask_key_prefix=f"row_{row_index}_")
             best = max(detections, key=lambda item: item.confidence, default=None)
-            predicted_label = best.label if best else NO_DETECTION_LABEL
+            object_label = best.label if best else NO_DETECTION_LABEL
             mask_path = ""
             image_width, image_height = _open_image_size(str(source_row[COLUMN_FILE_PATH]))
             if best and best.mask_key and masks_dir and best.mask_key in batch_masks:
@@ -649,13 +929,14 @@ def run_yoloe_labeling_impl(
                     COLUMN_FILE_PATH: source_row[COLUMN_FILE_PATH],
                     COLUMN_FILENAME: source_row[COLUMN_FILENAME],
                     COLUMN_FOLDER_LABEL: source_row[COLUMN_FOLDER_LABEL],
-                    COLUMN_PREDICTED_LABEL: predicted_label,
-                    COLUMN_CONFIDENCE: float(best.confidence if best else 0.0),
+                    COLUMN_OBJECT_LABEL: object_label,
+                    COLUMN_OBJECT_CONFIDENCE: float(best.confidence if best else 0.0),
+                    COLUMN_OBJECT_DETECTED: bool(best),
                     COLUMN_BBOX_XYXY: json.dumps(best.bbox if best else []),
                     COLUMN_HAS_MASK: bool(mask_path),
                     COLUMN_MASK_PATH: mask_path,
                     COLUMN_ALL_DETECTIONS_JSON: json.dumps([item.to_dict() for item in detections], ensure_ascii=False),
-                    COLUMN_FOLDER_MATCH: bool(best and best.label == source_row[COLUMN_FOLDER_LABEL]),
+                    COLUMN_LABEL_SOURCE: label_assignment_mode,
                     COLUMN_IMAGE_WIDTH: image_width,
                     COLUMN_IMAGE_HEIGHT: image_height,
                 }
@@ -667,10 +948,12 @@ def run_yoloe_labeling_impl(
         "dataset_csv_path": dataset_csv_path,
         "output_path": saved_csv,
         "rows": int(len(labeled_df)),
-        "classes": classes,
+        "task_mode": task_mode,
+        "label_assignment_mode": label_assignment_mode,
+        "object_prompts": object_prompts,
         "model_version": _model_version_from_path(model_path),
-        "detections_found": int((labeled_df[COLUMN_PREDICTED_LABEL] != NO_DETECTION_LABEL).sum()),
-        "no_detection_count": int((labeled_df[COLUMN_PREDICTED_LABEL] == NO_DETECTION_LABEL).sum()),
+        "detections_found": int(labeled_df[COLUMN_OBJECT_DETECTED].sum()),
+        "no_detection_count": int((~labeled_df[COLUMN_OBJECT_DETECTED]).sum()),
         "mask_count": int(labeled_df[COLUMN_HAS_MASK].sum()),
     }
     if report_output_path:
@@ -694,73 +977,14 @@ def save_segmentation_masks_impl(input_path: str, output_path: str, masks_dir: s
     }
 
 
-def split_low_confidence_examples_impl(
-    input_path: str,
-    review_dir: str,
-    threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-    output_confident_path: str = "",
-    output_uncertain_path: str = "",
-    manifest_output_path: str = "",
-    link_mode: str = DEFAULT_REVIEW_LINK_MODE,
-) -> ToolResult:
-    df = _read_table(input_path)
-    df[COLUMN_CONFIDENCE] = pd.to_numeric(df.get(COLUMN_CONFIDENCE), errors="coerce").fillna(0.0)
-    confident = df[df[COLUMN_CONFIDENCE] >= float(threshold)].reset_index(drop=True)
-    uncertain = df[df[COLUMN_CONFIDENCE] < float(threshold)].reset_index(drop=True)
-    review_root = Path(review_dir)
-    review_root.mkdir(parents=True, exist_ok=True)
-    manifest_rows: list[dict[str, Any]] = []
-    for _, row in uncertain.iterrows():
-        class_name = str(row.get(COLUMN_FOLDER_LABEL) or row.get(COLUMN_PREDICTED_LABEL) or "unassigned")
-        target_dir = review_root / class_name
-        target_dir.mkdir(parents=True, exist_ok=True)
-        source = Path(str(row[COLUMN_FILE_PATH]))
-        target = target_dir / source.name
-        _persist_review_pointer(source, target, link_mode)
-        manifest_rows.append(
-            {
-                COLUMN_FILE_PATH: str(source),
-                "review_path": str(target),
-                COLUMN_FILENAME: row[COLUMN_FILENAME],
-                COLUMN_FOLDER_LABEL: row.get(COLUMN_FOLDER_LABEL, ""),
-                COLUMN_PREDICTED_LABEL: row.get(COLUMN_PREDICTED_LABEL, ""),
-                COLUMN_CONFIDENCE: float(row.get(COLUMN_CONFIDENCE, 0.0) or 0.0),
-            }
-        )
-
-    payload = {
-        "threshold": float(threshold),
-        "review_dir": str(review_root),
-        "link_mode": link_mode,
-        "confident_count": int(len(confident)),
-        "uncertain_count": int(len(uncertain)),
-    }
-    if output_confident_path:
-        payload["confident_output_path"] = _write_table(confident, output_confident_path)
-    if output_uncertain_path:
-        payload["uncertain_output_path"] = _write_table(uncertain, output_uncertain_path)
-    if manifest_output_path:
-        manifest_df = pd.DataFrame(
-            manifest_rows,
-            columns=[
-                "file_path",
-                "review_path",
-                "filename",
-                "folder_label",
-                "predicted_label",
-                "confidence",
-            ],
-        )
-        payload["manifest_output_path"] = _write_table(manifest_df, manifest_output_path)
-    return payload
-
-
 def summarize_annotation_examples_impl(
     input_path: str,
     task: str,
     boundary_range_json: str = "",
     output_path: str = "",
     class_definitions: dict[str, str] | None = None,
+    object_prompts: list[str] | None = None,
+    label_assignment_mode: str = DEFAULT_LABEL_ASSIGNMENT_MODE,
 ) -> ToolResult:
     df = _read_table(input_path)
     if df.empty:
@@ -769,65 +993,71 @@ def summarize_annotation_examples_impl(
 
     class_candidates = [
         item
-        for item in sorted(set(df[COLUMN_FOLDER_LABEL].fillna("").astype(str)).union(set(df[COLUMN_PREDICTED_LABEL].fillna("").astype(str))))
+        for item in sorted(
+            set(df[COLUMN_FOLDER_LABEL].fillna("").astype(str))
+        )
         if item and item != NO_DETECTION_LABEL
     ]
     examples: dict[str, list[str]] = {}
     for label in class_candidates:
-        rows = df[df[COLUMN_FOLDER_LABEL].fillna(df[COLUMN_PREDICTED_LABEL]) == label].copy()
-        if rows.empty:
-            rows = df[df[COLUMN_PREDICTED_LABEL].fillna("") == label].copy()
-        rows[COLUMN_CONFIDENCE] = pd.to_numeric(rows.get(COLUMN_CONFIDENCE), errors="coerce").fillna(0.0)
-        selected = rows.sort_values(COLUMN_CONFIDENCE, ascending=False).head(3)
+        rows = df[df[COLUMN_FOLDER_LABEL].fillna("") == label].copy()
+        rows[COLUMN_OBJECT_CONFIDENCE] = pd.to_numeric(rows.get(COLUMN_OBJECT_CONFIDENCE), errors="coerce").fillna(0.0)
+        selected = rows.sort_values(COLUMN_OBJECT_CONFIDENCE, ascending=False).head(3)
         examples[label] = selected[COLUMN_FILE_PATH].astype(str).tolist()
 
-    edge_cases: list[dict[str, Any]] = []
+    raw_edge_cases: list[dict[str, Any]] = []
     for _, row in df.iterrows():
-        confidence = float(row.get(COLUMN_CONFIDENCE, 0.0) or 0.0)
-        predicted_label = str(row.get(COLUMN_PREDICTED_LABEL) or "")
+        confidence = float(row.get(COLUMN_OBJECT_CONFIDENCE, 0.0) or 0.0)
+        object_label = str(row.get(COLUMN_OBJECT_LABEL) or "")
         reasons: list[str] = []
         if low <= confidence <= high:
             reasons.append("boundary_confidence")
-        if not _bool_from_value(row.get(COLUMN_FOLDER_MATCH, False)):
-            reasons.append("folder_mismatch")
         detections = _parse_detection_list(row.get(COLUMN_ALL_DETECTIONS_JSON))
-        detection_labels = {str(item.get("label", "")).strip() for item in detections if str(item.get("label", "")).strip()}
-        if len(detection_labels) > 1:
-            reasons.append("multi_class_detection")
-        if predicted_label == NO_DETECTION_LABEL:
+        if len(detections) > 1:
+            reasons.append("multiple_detections")
+        if not _bool_from_value(row.get(COLUMN_OBJECT_DETECTED, False)) or object_label == NO_DETECTION_LABEL:
             reasons.append("no_detection")
         if reasons:
-            edge_cases.append(
+            raw_edge_cases.append(
                 {
                     COLUMN_FILE_PATH: str(row[COLUMN_FILE_PATH]),
                     "reason": ", ".join(reasons),
-                    COLUMN_PREDICTED_LABEL: predicted_label,
+                    COLUMN_OBJECT_LABEL: object_label,
                     COLUMN_FOLDER_LABEL: str(row.get(COLUMN_FOLDER_LABEL) or ""),
-                    COLUMN_CONFIDENCE: confidence,
+                    COLUMN_OBJECT_CONFIDENCE: confidence,
                 }
             )
+    edge_cases, edge_case_counts = _compact_edge_cases(raw_edge_cases)
 
     definitions = _class_definitions(class_candidates)
     if class_definitions:
         definitions.update({str(key): str(value) for key, value in class_definitions.items() if str(key) in definitions})
 
+    effective_object_prompts = [str(item).strip() for item in (object_prompts or []) if str(item).strip()]
     summary = AnnotationSpec(
         task_name=task,
-        task_description=f"Image annotation task for '{task}'. Use the examples and class definitions below to label images consistently.",
+        task_description=(
+            f"Image annotation task for '{task}'. Use the semantic class taxonomy from the dataset folders. "
+            f"Use the object prompts {effective_object_prompts or ['<missing>']} only for object localization and segmentation."
+        ),
+        object_prompts=effective_object_prompts,
         classes=definitions,
         examples=examples,
         edge_cases=edge_cases,
+        edge_case_counts=edge_case_counts,
         guidelines=(
-            "Assign the class that best matches the dominant object or scene in each image. "
-            "When the image is ambiguous, prefer the folder taxonomy, note uncertainty, and send low-confidence cases for manual review. "
-            f"When no class fits, use {NO_DETECTION_LABEL} and leave the bounding box empty."
+            "Assign the semantic class from the dataset taxonomy, not from the detector output. "
+            "Use detector predictions only to localize or segment the target object. "
+            f"If the target object is missing or the geometry is low confidence, keep the semantic class from the folder taxonomy, mark the case for manual review, and leave geometry empty when needed. "
+            f"Label assignment mode: {label_assignment_mode}."
         ),
     ).to_dict()
     payload = {
         "input_path": input_path,
         "task": task,
         "class_count": len(class_candidates),
-        "edge_case_count": len(edge_cases),
+        "edge_case_count": len(raw_edge_cases),
+        "edge_case_sample_count": len(edge_cases),
         "summary": summary,
     }
     if output_path:
@@ -843,9 +1073,11 @@ def generate_annotation_spec_impl(summary_path: str, task: str, output_path: str
     spec = AnnotationSpec(
         task_name=str(summary.get("task_name") or task),
         task_description=str(summary.get("task_description") or f"Image annotation task for '{task}'."),
+        object_prompts=[str(item) for item in list(summary.get("object_prompts", []))],
         classes={str(key): str(value) for key, value in dict(summary.get("classes", {})).items()},
         examples={str(key): [str(item) for item in value] for key, value in dict(summary.get("examples", {})).items()},
         edge_cases=list(summary.get("edge_cases", [])),
+        edge_case_counts={str(key): int(value) for key, value in dict(summary.get("edge_case_counts", {})).items()},
         guidelines=str(summary.get("guidelines") or ""),
     )
     markdown = spec_markdown.strip() or _render_spec_markdown(spec)
@@ -879,15 +1111,20 @@ def export_labelstudio_predictions_impl(
     input_path: str,
     output_path: str,
     review_output_path: str = "",
-    review_manifest_path: str = "",
     base_image_url: str = "/data/local-files/?d=",
     model_version: str | None = None,
+    local_files_document_root: str = "",
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> ToolResult:
     df = _read_table(input_path)
     effective_model_version = model_version or DEFAULT_MODEL_PATH
     all_records = []
     for _, row in df.iterrows():
-        image_reference = f"{base_image_url}{row[COLUMN_FILE_PATH]}" if base_image_url else str(row[COLUMN_FILE_PATH])
+        image_reference = _labelstudio_image_reference(
+            str(row[COLUMN_FILE_PATH]),
+            base_image_url=base_image_url,
+            local_files_document_root=local_files_document_root,
+        )
         all_records.append(_labelstudio_record(row, image_reference, model_version=effective_model_version))
 
     output_file = Path(output_path)
@@ -901,38 +1138,39 @@ def export_labelstudio_predictions_impl(
         "model_version": effective_model_version,
     }
     if review_output_path:
-        review_df = df.iloc[0:0].copy()
-        if review_manifest_path and Path(review_manifest_path).exists():
-            manifest = _read_table(review_manifest_path)
-            review_df = df[df[COLUMN_FILENAME].isin(manifest[COLUMN_FILENAME].astype(str))].reset_index(drop=True)
+        review_df = df[df.apply(lambda row: _needs_manual_review(row, float(confidence_threshold)), axis=1)].reset_index(drop=True)
         review_records = []
         for _, row in review_df.iterrows():
-            image_reference = f"{base_image_url}{row[COLUMN_FILE_PATH]}" if base_image_url else str(row[COLUMN_FILE_PATH])
+            image_reference = _labelstudio_image_reference(
+                str(row[COLUMN_FILE_PATH]),
+                base_image_url=base_image_url,
+                local_files_document_root=local_files_document_root,
+            )
             review_records.append(_labelstudio_record(row, image_reference, model_version=effective_model_version))
         review_file = Path(review_output_path)
         review_file.parent.mkdir(parents=True, exist_ok=True)
         review_file.write_text(json.dumps(_safe_json(review_records), ensure_ascii=False, indent=2), encoding="utf-8")
         payload["review_output_path"] = str(review_file)
         payload["review_record_count"] = len(review_records)
+        payload["review_confidence_threshold"] = float(confidence_threshold)
+    payload["local_files_document_root"] = str(Path(local_files_document_root).resolve()) if local_files_document_root else str(Path.cwd().resolve())
     return payload
 
 
 @tool
-def prepare_run_dir(artifacts_dir: str, dataset_name: str = "", run_id: str = "") -> str:
+def prepare_run_dir(artifacts_dir: str) -> str:
     """
-    Create a run directory with the standard annotation artifact layout.
+    Create the standard flat annotation artifact layout.
 
     Args:
-        artifacts_dir: Base directory where runs are stored.
-        dataset_name: Optional human-readable dataset name for the run prefix.
-        run_id: Optional explicit run identifier. Empty = generate one.
+        artifacts_dir: Base annotation directory.
 
     Returns:
-        JSON with run_dir and standard subdirectories.
+        JSON with the annotation root and standard subdirectories.
     """
-    logger.info("prepare_run_dir called: artifacts_dir=%s dataset_name=%s", artifacts_dir, dataset_name)
+    logger.info("prepare_run_dir called: artifacts_dir=%s", artifacts_dir)
     try:
-        return _json_success(prepare_run_dir_impl(artifacts_dir, dataset_name=dataset_name, run_id=run_id))
+        return _json_success(prepare_run_dir_impl(artifacts_dir))
     except Exception as exc:
         logger.exception("prepare_run_dir failed")
         return _json_error(str(exc))
@@ -1000,46 +1238,57 @@ def validate_image_dataset(dataset_dir: str, output_path: str = "") -> str:
 @tool
 def run_yoloe_labeling(
     dataset_csv_path: str,
-    classes_json: str,
     output_path: str,
+    object_prompts_json: str = "",
     model_path: str = DEFAULT_MODEL_PATH,
     mask_payload_path: str = "",
     masks_dir: str = "",
     batch_size: int = 16,
     report_output_path: str = "",
+    task_mode: str = DEFAULT_TASK_MODE,
+    label_assignment_mode: str = DEFAULT_LABEL_ASSIGNMENT_MODE,
+    classes_json: str = "",
 ) -> str:
     """
     Run YOLOE inference over the dataset manifest and save the labeled manifest.
 
     Args:
         dataset_csv_path: CSV from scan_image_dataset.
-        classes_json: JSON list of class names to set on YOLOE.
+        object_prompts_json: JSON list of object prompts to set on YOLOE.
         output_path: CSV path for labeled output.
         model_path: YOLOE model path.
         mask_payload_path: Deprecated NPZ path placeholder kept for backwards compatibility.
         masks_dir: Optional directory where masks are flushed immediately.
         batch_size: Batch size for YOLOE predict.
         report_output_path: Optional JSON report path.
+        task_mode: Annotation task mode. v1 supports image_classification.
+        label_assignment_mode: Semantic label assignment source. v1 supports folder_label.
+        classes_json: Deprecated alias for object_prompts_json.
 
     Returns:
         JSON with labeled output path, basic detection stats, and optional report path.
     """
     logger.info("run_yoloe_labeling called: dataset_csv_path=%s model_path=%s", dataset_csv_path, model_path)
     try:
-        classes = _parse_json_arg(classes_json, "classes_json")
-        if not isinstance(classes, list) or not classes:
-            raise ValueError("classes_json must be a non-empty JSON list of class names.")
+        prompts_payload = object_prompts_json or classes_json
+        if classes_json and not object_prompts_json:
+            _warn_deprecated_argument("run_yoloe_labeling", "classes_json", replacement="object_prompts_json")
+        object_prompts = _parse_json_arg(prompts_payload, "object_prompts_json")
+        if not isinstance(object_prompts, list) or not object_prompts:
+            raise ValueError("object_prompts_json must be a non-empty JSON list of prompts.")
         if mask_payload_path:
             _warn_deprecated_argument("run_yoloe_labeling", "mask_payload_path", replacement="masks_dir")
         return _json_success(
             run_yoloe_labeling_impl(
                 dataset_csv_path=dataset_csv_path,
-                classes=[str(item) for item in classes],
+                object_prompts=[str(item) for item in object_prompts],
                 output_path=output_path,
                 model_path=model_path,
                 masks_dir=masks_dir,
                 batch_size=batch_size,
                 report_output_path=report_output_path,
+                task_mode=task_mode,
+                label_assignment_mode=label_assignment_mode,
             )
         )
     except Exception as exc:
@@ -1081,55 +1330,14 @@ def save_segmentation_masks(
 
 
 @tool
-def split_low_confidence_examples(
-    input_path: str,
-    review_dir: str,
-    threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-    output_confident_path: str = "",
-    output_uncertain_path: str = "",
-    manifest_output_path: str = "",
-    link_mode: str = DEFAULT_REVIEW_LINK_MODE,
-) -> str:
-    """
-    Split labeled examples by confidence and copy low-confidence images for review.
-
-    Args:
-        input_path: Labeled CSV path.
-        review_dir: Directory where low-confidence images are copied.
-        threshold: Confidence threshold below which examples are routed for review.
-        output_confident_path: Optional CSV path for confident examples.
-        output_uncertain_path: Optional CSV path for uncertain examples.
-        manifest_output_path: Optional CSV manifest path for review items.
-        link_mode: "symlink", "copy", or "manifest_only" for review assets.
-
-    Returns:
-        JSON with counts and saved artifact paths.
-    """
-    logger.info("split_low_confidence_examples called: input_path=%s threshold=%s", input_path, threshold)
-    try:
-        return _json_success(
-            split_low_confidence_examples_impl(
-                input_path=input_path,
-                review_dir=review_dir,
-                threshold=threshold,
-                output_confident_path=output_confident_path,
-                output_uncertain_path=output_uncertain_path,
-                manifest_output_path=manifest_output_path,
-                link_mode=link_mode,
-            )
-        )
-    except Exception as exc:
-        logger.exception("split_low_confidence_examples failed")
-        return _json_error(str(exc))
-
-
-@tool
 def summarize_annotation_examples(
     input_path: str,
     task: str,
     boundary_range_json: str = "",
     output_path: str = "",
     class_definitions_json: str = "",
+    object_prompts_json: str = "",
+    label_assignment_mode: str = DEFAULT_LABEL_ASSIGNMENT_MODE,
 ) -> str:
     """
     Summarize high-confidence examples and edge cases for spec generation.
@@ -1140,6 +1348,8 @@ def summarize_annotation_examples(
         boundary_range_json: Optional JSON list [low, high] for boundary-confidence edge cases.
         output_path: Optional JSON path to save the summary.
         class_definitions_json: Optional JSON object with explicit class definitions.
+        object_prompts_json: Optional JSON list of object prompts used for geometry extraction.
+        label_assignment_mode: Source of semantic labels. v1 supports folder_label.
 
     Returns:
         JSON with class definitions, examples, edge cases, and guidance context.
@@ -1147,6 +1357,7 @@ def summarize_annotation_examples(
     logger.info("summarize_annotation_examples called: input_path=%s task=%s", input_path, task)
     try:
         class_definitions = _parse_json_arg(class_definitions_json, "class_definitions_json") if class_definitions_json else None
+        object_prompts = _parse_json_arg(object_prompts_json, "object_prompts_json") if object_prompts_json else None
         return _json_success(
             summarize_annotation_examples_impl(
                 input_path=input_path,
@@ -1154,6 +1365,8 @@ def summarize_annotation_examples(
                 boundary_range_json=boundary_range_json,
                 output_path=output_path,
                 class_definitions=class_definitions,
+                object_prompts=object_prompts,
+                label_assignment_mode=label_assignment_mode,
             )
         )
     except Exception as exc:
@@ -1202,7 +1415,7 @@ def compute_annotation_quality(
         confidence_threshold: Threshold used for low-confidence stats.
 
     Returns:
-        JSON with label distribution, confidence stats, folder_match_rate, and optional agreement metrics.
+        JSON with semantic label distribution, object detection stats, confidence stats, and optional agreement metrics.
     """
     logger.info("compute_annotation_quality called: input_path=%s human_labels_path=%s", input_path, human_labels_path)
     try:
@@ -1220,13 +1433,76 @@ def compute_annotation_quality(
 
 
 @tool
+def build_object_labels(
+    input_path: str,
+    output_path: str,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+) -> str:
+    """
+    Build a canonical object-level labels.csv for AL/detection from auto-labeled image rows.
+
+    Args:
+        input_path: Image-level labeled.csv path.
+        output_path: Output CSV path with one row per bbox.
+        confidence_threshold: Threshold below which auto-labeled detections are marked split=review.
+
+    Returns:
+        JSON with saved output path and row count.
+    """
+    logger.info("build_object_labels called: input_path=%s", input_path)
+    try:
+        return _json_success(
+            build_object_labels_impl(
+                input_path=input_path,
+                output_path=output_path,
+                confidence_threshold=confidence_threshold,
+            )
+        )
+    except Exception as exc:
+        logger.exception("build_object_labels failed")
+        return _json_error(str(exc))
+
+
+@tool
+def convert_labelstudio_export_to_object_labels(
+    export_path: str,
+    output_path: str,
+    local_files_document_root: str = "",
+) -> str:
+    """
+    Convert Label Studio CSV export into canonical object-level human_labels.csv for AL/detection.
+
+    Args:
+        export_path: CSV export from Label Studio.
+        output_path: Output CSV path with one row per human bbox.
+        local_files_document_root: Host-side root used for /data/local-files/?d=... references.
+
+    Returns:
+        JSON with saved output path and row count.
+    """
+    logger.info("convert_labelstudio_export_to_object_labels called: export_path=%s", export_path)
+    try:
+        return _json_success(
+            convert_labelstudio_export_to_object_labels_impl(
+                export_path=export_path,
+                output_path=output_path,
+                local_files_document_root=local_files_document_root,
+            )
+        )
+    except Exception as exc:
+        logger.exception("convert_labelstudio_export_to_object_labels failed")
+        return _json_error(str(exc))
+
+
+@tool
 def export_labelstudio_predictions(
     input_path: str,
     output_path: str,
     review_output_path: str = "",
-    review_manifest_path: str = "",
     base_image_url: str = "/data/local-files/?d=",
     model_version: str = "",
+    local_files_document_root: str = "",
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> str:
     """
     Export auto-label predictions to Label Studio import JSON files.
@@ -1235,9 +1511,10 @@ def export_labelstudio_predictions(
         input_path: Labeled CSV path.
         output_path: JSON output path for all images.
         review_output_path: Optional JSON output path for low-confidence review images.
-        review_manifest_path: Optional manifest CSV from split_low_confidence_examples.
         base_image_url: Prefix used to build Label Studio local-files image references.
         model_version: Optional model version string stored in Label Studio predictions.
+        local_files_document_root: Host-side root directory that Label Studio serves for /data/local-files/.
+        confidence_threshold: Threshold below which auto-labeled examples are routed to review JSON.
 
     Returns:
         JSON with saved output paths and record counts.
@@ -1249,9 +1526,10 @@ def export_labelstudio_predictions(
                 input_path=input_path,
                 output_path=output_path,
                 review_output_path=review_output_path,
-                review_manifest_path=review_manifest_path,
                 base_image_url=base_image_url,
                 model_version=model_version or None,
+                local_files_document_root=local_files_document_root,
+                confidence_threshold=confidence_threshold,
             )
         )
     except Exception as exc:

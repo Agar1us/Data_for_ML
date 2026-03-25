@@ -8,6 +8,7 @@ from typing import Any
 from smolagents import OpenAIModel, ToolCallingAgent
 
 from data_quality_tools_agent.tools import (
+    _deduplicate_image_dataset,
     apply_cleaning_plan,
     compare_before_after,
     compute_correlations,
@@ -258,23 +259,33 @@ class ToolBasedDataQualityAgent:
         threshold: int = 8,
         dry_run: bool = False,
     ) -> dict:
-        result = self._run_agent(
-            task_name="image_dedup",
-            task=IMAGE_DEDUP_TASK,
-            additional_args={
-                "input_dir": input_dir,
-                "output_dir": output_dir or "",
-                "hash_func_name": hash_func_name,
-                "hash_size": int(hash_size),
-                "threshold": int(threshold),
-                "dry_run": bool(dry_run),
-                "artifacts_dir": str(self.artifacts_dir),
-                "task_description": self.task_description or "",
-            },
-            max_steps=8,
+        output_root = Path(output_dir or self.artifacts_dir)
+        reports_dir = output_root / "reports"
+        result = _deduplicate_image_dataset(
+            input_dir=input_dir,
+            output_dir=str(output_root),
+            hash_func_name=hash_func_name,
+            hash_size=int(hash_size),
+            threshold=int(threshold),
+            dry_run=bool(dry_run),
+            report_output_path=str(reports_dir / "dedup_report.json"),
+            duplicates_output_path=str(reports_dir / "duplicates.csv"),
         )
-        self._require_paths(result, ["output_dir", "report_path", "duplicates_path"])
-        return result
+        normalized = {
+            "output_dir": str(Path(result["output_dir"]).resolve()),
+            "report_path": str(Path(result["report_output_path"]).resolve()),
+            "duplicates_path": str(Path(result["duplicates_output_path"]).resolve()),
+            "totals": {
+                "before": int(result["total_before"]),
+                "after": int(result["total_after"]),
+                "removed": int(result["total_removed"]),
+            },
+            "duplicate_ratio": float(result["duplicate_ratio"]),
+            "unreadable_count": int(len(result.get("unreadable_files", []))),
+        }
+        self._require_paths(normalized, ["output_dir", "report_path", "duplicates_path"])
+        self.last_result = normalized
+        return normalized
 
     @staticmethod
     def _tools_for_task(task_name: str) -> list:

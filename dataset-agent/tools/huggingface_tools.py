@@ -4,26 +4,15 @@ import json
 import os
 
 from smolagents import tool
+from tools.path_utils import data_root, resolve_data_output_dir
 
 
 def _data_root() -> str:
-    return os.getenv("DATASET_AGENT_DATA_DIR", "data")
+    return str(data_root())
 
 
 def _resolve_output_dir(path: str) -> str:
-    if os.path.isabs(path):
-        return path
-
-    normalized = os.path.normpath(path)
-    data_root = _data_root()
-    data_dir_name = os.path.basename(os.path.normpath(data_root))
-
-    if normalized == data_dir_name:
-        normalized = ""
-    elif normalized.startswith(f"{data_dir_name}{os.sep}"):
-        normalized = normalized[len(data_dir_name) + 1 :]
-
-    return os.path.join(data_root, normalized) if normalized else data_root
+    return resolve_data_output_dir(path)
 
 
 @tool

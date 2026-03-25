@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 from smolagents import tool
 
 from parsers.yandex_images import Parser
+from tools.path_utils import data_root, resolve_data_output_dir
 
 
 _SEARCH_CALL_CACHE: dict[tuple[str, str, str, str, float, bool, str], str] = {}
+_GENERIC_SAVE_DIR_NAMES = {"collection", "images", "image", "raw", "downloads", "download", "dataset", "datasets"}
+_QUERY_ROOT_NAMES = {"originals"}
 
 
 def _infer_extension(url: str, content_type: str) -> str:
@@ -30,17 +34,17 @@ def _infer_extension(url: str, content_type: str) -> str:
 def _cache_key(
     query: str,
     save_dir: str,
-    size: str,
-    image_type: str,
+    size: str | None,
+    image_type: str | None,
     delay: float,
     headless: bool,
-    profile_dir: str,
+    profile_dir: str | None,
 ) -> tuple[str, str, str, str, float, bool, str]:
     return (
         query.strip().casefold(),
-        os.path.abspath(save_dir),
-        size.strip().casefold(),
-        image_type.strip().casefold(),
+        resolve_data_output_dir(save_dir),
+        (size or "").strip().casefold(),
+        (image_type or "").strip().casefold(),
         float(delay),
         bool(headless),
         os.path.abspath(profile_dir) if profile_dir else "",
@@ -54,11 +58,22 @@ def _slugify_query(query: str) -> str:
 
 
 def _resolve_class_save_dir(save_dir: str, query: str) -> str:
-    root_dir = os.path.abspath(save_dir)
-    class_dir_name = _slugify_query(query)
-    if os.path.basename(root_dir).casefold() == class_dir_name.casefold():
-        return root_dir
-    return os.path.join(root_dir, class_dir_name)
+    root_dir = Path(resolve_data_output_dir(save_dir))
+    query_dir_name = _slugify_query(query)
+    try:
+        relative_parts = list(root_dir.resolve().relative_to(data_root()).parts)
+    except Exception:
+        relative_parts = list(root_dir.parts)
+    cleaned_parts = [
+        part
+        for part in relative_parts
+        if part.casefold() not in _QUERY_ROOT_NAMES and part.casefold() not in _GENERIC_SAVE_DIR_NAMES
+    ]
+    class_dir_name = cleaned_parts[-1] if cleaned_parts else root_dir.name or "images"
+    class_root = (data_root() / class_dir_name).resolve()
+    if class_root.name.casefold() == query_dir_name.casefold():
+        return str(class_root)
+    return str((class_root / query_dir_name).resolve())
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -104,7 +119,10 @@ def search_and_download_images(
         else float(os.environ.get("DATASET_AGENT_MANUAL_CAPTCHA_TIMEOUT", "0") or 0.0)
     )
     resolved_save_dir = _resolve_class_save_dir(save_dir, query)
-    effective_profile_dir = profile_dir.strip() or os.environ.get("DATASET_AGENT_CHROME_PROFILE_DIR", "").strip()
+    resolved_save_dir_path = Path(resolved_save_dir)
+    class_dir_name = resolved_save_dir_path.parent.name if resolved_save_dir_path.parent != resolved_save_dir_path else resolved_save_dir_path.name
+    query_dir_name = resolved_save_dir_path.name
+    effective_profile_dir = (profile_dir or "").strip() or os.environ.get("DATASET_AGENT_CHROME_PROFILE_DIR", "").strip()
     key = _cache_key(
         query,
         resolved_save_dir,
@@ -161,8 +179,8 @@ def search_and_download_images(
             "query": query,
             "limit": int(limit),
             "save_dir": save_dir,
-            "size": size,
-            "image_type": image_type,
+            "size": size or "",
+            "image_type": image_type or "",
             "delay": float(delay),
             "headless": False,
             "profile_dir": effective_profile_dir or os.path.join(os.path.abspath(save_dir), ".chrome_profile"),
@@ -174,9 +192,10 @@ def search_and_download_images(
     payload = {
         "status": status,
         "query": query,
-        "save_dir": os.path.abspath(save_dir),
+        "save_dir": resolve_data_output_dir(save_dir),
         "resolved_save_dir": resolved_save_dir,
-        "class_dir_name": os.path.basename(resolved_save_dir),
+        "class_dir_name": class_dir_name,
+        "query_dir_name": query_dir_name,
         "requested_limit": int(limit),
         "delay": float(delay),
         "headless": bool(effective_headless),

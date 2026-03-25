@@ -610,7 +610,7 @@ def _collect_images_by_class(input_dir: str) -> dict[str, list[Path]]:
     for subdir in sorted(root.iterdir()):
         if not subdir.is_dir():
             continue
-        files = [path for path in sorted(subdir.iterdir()) if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS]
+        files = [path for path in sorted(subdir.rglob("*")) if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS]
         if files:
             images_by_class[subdir.name] = files
     return images_by_class
@@ -661,15 +661,19 @@ def _find_unique_images(
     return [path for path, _ in unique], duplicates
 
 
-def _copy_unique_images(unique_paths: list[Path], output_dir: Path, class_name: str) -> list[str]:
-    target_dir = output_dir / class_name
-    target_dir.mkdir(parents=True, exist_ok=True)
+def _copy_unique_images(unique_paths: list[Path], input_dir: Path, output_dir: Path, class_name: str) -> list[str]:
+    class_root = input_dir / class_name
     copied_paths: list[str] = []
     for source_path in unique_paths:
-        destination = target_dir / source_path.name
+        try:
+            relative_path = source_path.relative_to(class_root)
+        except ValueError:
+            relative_path = Path(source_path.name)
+        destination = output_dir / class_name / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
         counter = 1
         while destination.exists():
-            destination = target_dir / f"{source_path.stem}_{counter}{source_path.suffix}"
+            destination = destination.with_name(f"{source_path.stem}_{counter}{source_path.suffix}")
             counter += 1
         shutil.copy2(source_path, destination)
         copied_paths.append(str(destination))
@@ -701,6 +705,7 @@ def _deduplicate_image_dataset(
     if not images_by_class:
         raise ValueError(f"No class subdirectories with supported image files were found in: {input_dir}")
 
+    input_root = Path(input_dir)
     output_root = Path(output_dir)
     report_rows: list[dict[str, Any]] = []
     duplicate_rows: list[dict[str, Any]] = []
@@ -717,7 +722,7 @@ def _deduplicate_image_dataset(
         )
         unique_paths, duplicate_paths = _find_unique_images(hashed_images, threshold=threshold)
         if not dry_run:
-            _copy_unique_images(unique_paths, output_root, class_name)
+            _copy_unique_images(unique_paths, input_root, output_root, class_name)
 
         class_before = len(image_paths)
         class_after = len(unique_paths)
