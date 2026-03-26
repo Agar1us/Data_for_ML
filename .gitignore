@@ -197,3 +197,7 @@ pyrightconfig.json
 data/
 logs/
 reports/
+quality_tools_artifacts/
+tests/
+review.md
+annotation_artifacts/
