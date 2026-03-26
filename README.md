@@ -27,20 +27,22 @@
 6. Пользователь размечает batch в Label Studio.
 7. `al-agent` подхватывает human export, мержит его и переобучает модель.
 
+[Видео работы пайплайна](https://drive.google.com/file/d/1zLpQHeqt8pa87nIiv7iSfpGSAMGfSbWr/view?usp=sharing) 
+
 ## Структура агентов
 
-- [dataset-agent](/home/agar1us/Data_for_ML/dataset-agent)
-- [data_quality_tools_agent](/home/agar1us/Data_for_ML/data_quality_tools_agent)
-- [annotation_agent](/home/agar1us/Data_for_ML/annotation_agent)
-- [al_agent](/home/agar1us/Data_for_ML/al_agent)
+- [dataset-agent](/dataset-agent)
+- [data_quality_tools_agent](/data_quality_tools_agent)
+- [annotation_agent](/annotation_agent)
+- [al_agent](/Data_for_ML/al_agent)
 
 Главный orchestration entrypoint:
-- [testing_pipeline.py](/home/agar1us/Data_for_ML/testing_pipeline.py)
+- [testing_pipeline.py](/testing_pipeline.py)
 
 ## Артефакты pipeline
 
 По умолчанию все stage-артефакты пишутся в:
-- [data/current_run](/home/agar1us/Data_for_ML/data/current_run)
+- [data/current_run](/data/current_run)
 
 Основные каталоги:
 - `data/current_run/collection`
@@ -52,7 +54,7 @@
 ## Зависимости
 
 В репозитории используется единый файл зависимостей:
-- [requirements.txt](/home/agar1us/Data_for_ML/requirements.txt)
+- [requirements.txt](/requirements.txt)
 
 Установка:
 
@@ -128,7 +130,7 @@ docker run -it -p 8080:8080 \
 
 ## Полезные CLI-параметры
 
-У [testing_pipeline.py](/home/agar1us/Data_for_ML/testing_pipeline.py) есть, в частности:
+У [testing_pipeline.py](/testing_pipeline.py) есть, в частности:
 
 - `--stages`
 - `--annotation-object-prompt`
