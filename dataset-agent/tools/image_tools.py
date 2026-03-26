@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -11,11 +10,10 @@ from smolagents import tool
 
 from parsers.yandex_images import Parser
 from tools.path_utils import data_root, resolve_data_output_dir
+from tools.runtime import logs_root, run_log_dir, yandex_headless, yandex_manual_captcha_timeout, yandex_profile_dir
 
 
-_SEARCH_CALL_CACHE: dict[tuple[str, str, str, str, float, bool, str], str] = {}
-_GENERIC_SAVE_DIR_NAMES = {"collection", "images", "image", "raw", "downloads", "download", "dataset", "datasets"}
-_QUERY_ROOT_NAMES = {"originals"}
+_SEARCH_CALL_CACHE: dict[tuple[str, str, str, str, bool, str], str] = {}
 
 
 def _infer_extension(url: str, content_type: str) -> str:
@@ -37,18 +35,16 @@ def _cache_key(
     save_dir: str,
     size: str | None,
     image_type: str | None,
-    delay: float,
     headless: bool,
     profile_dir: str | None,
-) -> tuple[str, str, str, str, float, bool, str]:
+) -> tuple[str, str, str, str, bool, str]:
     return (
         query.strip().casefold(),
         resolve_data_output_dir(save_dir),
         (size or "").strip().casefold(),
         (image_type or "").strip().casefold(),
-        float(delay),
         bool(headless),
-        os.path.abspath(profile_dir) if profile_dir else "",
+        str(Path(profile_dir).expanduser().resolve()) if profile_dir else "",
     )
 
 
@@ -59,39 +55,22 @@ def _slugify_query(query: str) -> str:
 
 
 def _resolve_class_save_dir(save_dir: str, query: str) -> str:
-    root_dir = Path(resolve_data_output_dir(save_dir))
-    query_dir_name = _slugify_query(query)
-    try:
-        relative_parts = list(root_dir.resolve().relative_to(data_root()).parts)
-    except Exception:
-        relative_parts = list(root_dir.parts)
-    cleaned_parts = [
-        part
-        for part in relative_parts
-        if part.casefold() not in _QUERY_ROOT_NAMES and part.casefold() not in _GENERIC_SAVE_DIR_NAMES
-    ]
-    class_dir_name = cleaned_parts[-1] if cleaned_parts else root_dir.name or "images"
-    class_root = (data_root() / class_dir_name).resolve()
-    if class_root.name.casefold() == query_dir_name.casefold():
-        return str(class_root)
-    return str((class_root / query_dir_name).resolve())
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off"}
+    class_dir = Path(resolve_data_output_dir(save_dir))
+    relative_parts = class_dir.resolve().relative_to(data_root()).parts
+    if len(relative_parts) != 1:
+        raise ValueError(
+            "search_and_download_images expects save_dir to point to exactly one class directory "
+            "directly under the configured collection root."
+        )
+    query_slug = _slugify_query(query)
+    if class_dir.name.casefold() == query_slug.casefold():
+        return str(class_dir)
+    return str((class_dir / query_slug).resolve())
 
 
 def _append_tool_log(record: dict) -> None:
-    log_dir = (
-        os.environ.get("DATASET_AGENT_RUN_LOG_DIR", "").strip()
-        or os.environ.get("DATASET_AGENT_LOGS_DIR", "").strip()
-    )
-    if not log_dir:
-        return
-    log_path = Path(log_dir) / "yandex_image_tool_log.jsonl"
+    log_root = run_log_dir() or logs_root()
+    log_path = log_root / "yandex_image_tool_log.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -124,34 +103,49 @@ def search_and_download_images(
         manual_captcha_timeout: In non-headless mode, wait this many seconds for manual captcha solving.
 
     Returns:
-        A summary string with downloaded and failed image counts.
+        A compact JSON string for the agent.
     """
-    effective_headless = headless if headless is not None else _env_flag("DATASET_AGENT_YANDEX_HEADLESS", True)
+    effective_headless = headless if headless is not None else yandex_headless()
     effective_manual_captcha_timeout = (
-        float(manual_captcha_timeout)
-        if manual_captcha_timeout is not None
-        else float(os.environ.get("DATASET_AGENT_MANUAL_CAPTCHA_TIMEOUT", "0") or 0.0)
+        float(manual_captcha_timeout) if manual_captcha_timeout is not None else yandex_manual_captcha_timeout()
     )
-    resolved_save_dir = _resolve_class_save_dir(save_dir, query)
-    resolved_save_dir_path = Path(resolved_save_dir)
-    class_dir_name = resolved_save_dir_path.parent.name if resolved_save_dir_path.parent != resolved_save_dir_path else resolved_save_dir_path.name
-    query_dir_name = resolved_save_dir_path.name
-    effective_profile_dir = (profile_dir or "").strip() or os.environ.get("DATASET_AGENT_CHROME_PROFILE_DIR", "").strip()
+    effective_profile_dir = (profile_dir or "").strip() or yandex_profile_dir()
+
+    try:
+        requested_save_dir = resolve_data_output_dir(save_dir)
+        resolved_save_dir = _resolve_class_save_dir(save_dir, query)
+    except ValueError as exc:
+        payload = {
+            "status": "error",
+            "query": query,
+            "save_dir": save_dir,
+            "downloaded": 0,
+            "failed": 0,
+            "message": str(exc),
+        }
+        _append_tool_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "tool": "search_and_download_images",
+                "cache_hit": False,
+                "query": query,
+                "requested_limit": int(limit),
+                "save_dir": save_dir,
+                "result": payload,
+            }
+        )
+        return json.dumps(payload, ensure_ascii=False)
+
     key = _cache_key(
-        query,
-        resolved_save_dir,
-        size,
-        image_type,
-        delay,
-        effective_headless,
-        effective_profile_dir,
+        query=query,
+        save_dir=resolved_save_dir,
+        size=size,
+        image_type=image_type,
+        headless=effective_headless,
+        profile_dir=effective_profile_dir,
     )
     if key in _SEARCH_CALL_CACHE:
         cached_result = _SEARCH_CALL_CACHE[key]
-        try:
-            cached_payload = json.loads(cached_result)
-        except json.JSONDecodeError:
-            cached_payload = {"raw_result": cached_result}
         _append_tool_log(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -159,29 +153,27 @@ def search_and_download_images(
                 "cache_hit": True,
                 "query": query,
                 "requested_limit": int(limit),
-                "save_dir": resolve_data_output_dir(save_dir),
+                "save_dir": requested_save_dir,
                 "resolved_save_dir": resolved_save_dir,
                 "headless": bool(effective_headless),
                 "profile_dir": effective_profile_dir,
-                "result": cached_payload,
+                "result": json.loads(cached_result),
             }
         )
         return cached_result
 
-    parser = Parser(
-        headless=effective_headless,
-        profile_dir=effective_profile_dir or None,
-    )
+    parser = Parser(headless=effective_headless, profile_dir=effective_profile_dir or None)
     urls = parser.query_search(
         query=query,
         limit=limit,
         delay=delay,
         manual_captcha_timeout=effective_manual_captcha_timeout,
-        size=size,
-        image_type=image_type,
+        size=size or None,
+        image_type=image_type or None,
     )
 
-    os.makedirs(resolved_save_dir, exist_ok=True)
+    resolved_dir = Path(resolved_save_dir)
+    resolved_dir.mkdir(parents=True, exist_ok=True)
     downloaded = 0
     failed = 0
     failure_details: list[dict[str, str | int]] = []
@@ -192,8 +184,8 @@ def search_and_download_images(
             response = requests.get(url, headers=headers, timeout=20)
             response.raise_for_status()
             ext = _infer_extension(url, response.headers.get("Content-Type", "").lower())
-            file_path = os.path.join(resolved_save_dir, f"{index:05d}.{ext}")
-            with open(file_path, "wb") as handle:
+            file_path = resolved_dir / f"{index:05d}.{ext}"
+            with file_path.open("wb") as handle:
                 handle.write(response.content)
             downloaded += 1
         except Exception as exc:
@@ -204,73 +196,24 @@ def search_and_download_images(
                 "error": type(exc).__name__,
                 "message": str(exc),
             }
-            if hasattr(exc, "response") and getattr(exc, "response", None) is not None:
-                response = getattr(exc, "response", None)
-                status_code = getattr(response, "status_code", None)
-                if status_code is not None:
-                    failure_record["status_code"] = int(status_code)
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code is not None:
+                failure_record["status_code"] = int(status_code)
             failure_details.append(failure_record)
 
-    status = "ok"
-    completed = True
-    should_retry_same_query = False
-    retry_recommended_manually = False
-    suggested_retry = None
-    if parser.last_debug_info.get("captcha_suspected"):
-        status = "captcha_blocked"
-        completed = False
-        should_retry_same_query = True
-        retry_recommended_manually = True
-        suggested_retry = {
-            "query": query,
-            "limit": int(limit),
-            "save_dir": save_dir,
-            "size": size or "",
-            "image_type": image_type or "",
-            "delay": float(delay),
-            "headless": False,
-            "profile_dir": effective_profile_dir or os.path.join(os.path.abspath(save_dir), ".chrome_profile"),
-            "manual_captcha_timeout": max(180.0, float(effective_manual_captcha_timeout)),
-        }
-    elif not urls:
-        status = "no_results"
-
+    captcha_suspected = bool(parser.last_debug_info.get("captcha_suspected", False))
+    status = "captcha_blocked" if captcha_suspected else ("no_results" if not urls else "ok")
     payload = {
         "status": status,
         "query": query,
-        "save_dir": resolve_data_output_dir(save_dir),
-        "resolved_save_dir": resolved_save_dir,
-        "class_dir_name": class_dir_name,
-        "query_dir_name": query_dir_name,
-        "requested_limit": int(limit),
-        "delay": float(delay),
-        "headless": bool(effective_headless),
-        "profile_dir": effective_profile_dir,
-        "manual_captcha_timeout": float(effective_manual_captcha_timeout),
-        "resolved_urls": int(len(urls)),
+        "save_dir": resolved_save_dir,
         "downloaded": int(downloaded),
         "failed": int(failed),
-        "failed_downloads": failure_details,
-        "driver_title": parser.last_debug_info.get("driver_title", ""),
-        "driver_url": parser.last_debug_info.get("driver_url", ""),
-        "debug_html_path": parser.last_debug_info.get("debug_html_path", ""),
-        "debug_screenshot_path": parser.last_debug_info.get("debug_screenshot_path", ""),
-        "captcha_suspected": bool(parser.last_debug_info.get("captcha_suspected", False)),
-        "wait_timed_out": bool(parser.last_debug_info.get("wait_timed_out", False)),
-        "manual_captcha_waited": bool(parser.last_debug_info.get("manual_captcha_waited", False)),
-        "completed": completed,
-        "should_retry_same_query": should_retry_same_query,
-        "retry_recommended_manually": retry_recommended_manually,
-        "suggested_retry_args": suggested_retry,
-        "message": (
-            "Captcha was detected. Re-run the same tool with headless disabled, a persistent profile_dir, "
-            "and enough manual_captcha_timeout so the user can solve the captcha in the opened browser."
-            if status == "captcha_blocked"
-            else "Search attempt completed. Do not retry the same query in this run; "
-            "reuse these results or move on to metadata/final reporting."
-        ),
+        "message": "Captcha was detected. Retry once manually in non-headless mode." if captcha_suspected else "Search attempt completed.",
     }
     result = json.dumps(payload, ensure_ascii=False)
+
     _append_tool_log(
         {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -278,10 +221,20 @@ def search_and_download_images(
             "cache_hit": False,
             "query": query,
             "requested_limit": int(limit),
-            "save_dir": resolve_data_output_dir(save_dir),
+            "save_dir": requested_save_dir,
             "resolved_save_dir": resolved_save_dir,
+            "resolved_urls": int(len(urls)),
             "headless": bool(effective_headless),
             "profile_dir": effective_profile_dir,
+            "manual_captcha_timeout": float(effective_manual_captcha_timeout),
+            "failed_downloads": failure_details,
+            "driver_title": parser.last_debug_info.get("driver_title", ""),
+            "driver_url": parser.last_debug_info.get("driver_url", ""),
+            "debug_html_path": parser.last_debug_info.get("debug_html_path", ""),
+            "debug_screenshot_path": parser.last_debug_info.get("debug_screenshot_path", ""),
+            "captcha_suspected": captcha_suspected,
+            "wait_timed_out": bool(parser.last_debug_info.get("wait_timed_out", False)),
+            "manual_captcha_waited": bool(parser.last_debug_info.get("manual_captcha_waited", False)),
             "result": payload,
         }
     )

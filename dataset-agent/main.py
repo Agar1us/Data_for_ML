@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from config import AgentConfig, PROJECT_ROOT
+from tools.runtime import set_runtime_context
 
 
 def setup_logging(config: AgentConfig, query: str) -> str:
@@ -134,13 +134,14 @@ def main() -> int:
     config.data_root.mkdir(parents=True, exist_ok=True)
     config.logs_root.mkdir(parents=True, exist_ok=True)
     config.artifacts_root.mkdir(parents=True, exist_ok=True)
-    os.environ["DATASET_AGENT_DATA_DIR"] = str(config.data_root)
-    os.environ["DATASET_AGENT_LOGS_DIR"] = str(config.logs_root)
-    os.environ["DATASET_AGENT_ARTIFACTS_DIR"] = str(config.artifacts_root)
-    os.environ["DATASET_AGENT_YANDEX_HEADLESS"] = "1" if config.yandex_headless else "0"
-    os.environ["DATASET_AGENT_MANUAL_CAPTCHA_TIMEOUT"] = str(config.yandex_manual_captcha_timeout)
-    if config.yandex_profile_dir:
-        os.environ["DATASET_AGENT_CHROME_PROFILE_DIR"] = config.yandex_profile_dir
+    set_runtime_context(
+        data_root=config.data_root,
+        logs_root=config.logs_root,
+        artifacts_root=config.artifacts_root,
+        yandex_headless=config.yandex_headless,
+        yandex_manual_captcha_timeout=config.yandex_manual_captcha_timeout,
+        yandex_profile_dir=config.yandex_profile_dir,
+    )
 
     try:
         ensure_dependencies()
@@ -155,7 +156,15 @@ def main() -> int:
     print("-" * 60)
 
     log_dir = setup_logging(config, args.query)
-    os.environ["DATASET_AGENT_RUN_LOG_DIR"] = log_dir
+    set_runtime_context(
+        data_root=config.data_root,
+        logs_root=config.logs_root,
+        artifacts_root=config.artifacts_root,
+        run_log_dir=log_dir,
+        yandex_headless=config.yandex_headless,
+        yandex_manual_captcha_timeout=config.yandex_manual_captcha_timeout,
+        yandex_profile_dir=config.yandex_profile_dir,
+    )
     orchestrator = create_orchestrator(config)
 
     try:

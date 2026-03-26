@@ -4,15 +4,7 @@ import json
 import os
 
 from smolagents import tool
-from tools.path_utils import data_root, resolve_data_output_dir
-
-
-def _data_root() -> str:
-    return str(data_root())
-
-
-def _resolve_output_dir(path: str) -> str:
-    return resolve_data_output_dir(path)
+from tools.path_utils import resolve_data_output_dir
 
 
 def _get_api():
@@ -69,7 +61,10 @@ def download_kaggle_dataset(dataset_ref: str, save_dir: str) -> str:
     Returns:
         A status string with the output directory and downloaded files.
     """
-    target_dir = _resolve_output_dir(save_dir)
+    try:
+        target_dir = resolve_data_output_dir(save_dir)
+    except ValueError as exc:
+        return f"Error: {exc}"
     os.makedirs(target_dir, exist_ok=True)
 
     try:

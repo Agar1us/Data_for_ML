@@ -251,6 +251,32 @@ def _extract_object_prompts_from_dataset_result(result: Any) -> list[str]:
     return _normalize_prompt_list(payload.get("object_prompt"))
 
 
+def _invalid_object_prompts_shape_message(result: Any) -> str:
+    payload = result
+    if isinstance(result, str):
+        try:
+            payload = json.loads(result)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    raw_prompts = payload.get("object_prompts")
+    if isinstance(raw_prompts, dict):
+        return (
+            "dataset-agent returned object_prompts as a dict of per-class values. "
+            "annotation stage requires one generic English object prompt, for example ['swan']."
+        )
+
+    raw_prompt = payload.get("object_prompt")
+    if isinstance(raw_prompt, dict):
+        return (
+            "dataset-agent returned object_prompt as a dict. "
+            "annotation stage requires one generic English object prompt, for example 'swan'."
+        )
+    return ""
+
+
 def _prepare_dataset_stage_artifacts(dataset_dir: Path, query: str, object_prompts: list[str] | None) -> dict[str, Any]:
     class_mapping_path, raw_counts, warnings = _write_class_mapping(dataset_dir, query)
     annotation_config_path = _write_annotation_config(dataset_dir, object_prompts)
@@ -281,6 +307,9 @@ def _resolve_annotation_object_prompts(
     prompts = _extract_object_prompts_from_dataset_result(dataset_stage.get("result"))
     if prompts:
         return prompts
+    invalid_shape_message = _invalid_object_prompts_shape_message(dataset_stage.get("result"))
+    if invalid_shape_message:
+        raise RuntimeError(invalid_shape_message)
     raise RuntimeError(
         "annotation object prompts are required for the annotation stage. "
         "Pass --annotation-object-prompt ..., provide collection/annotation_config.json, "
@@ -388,6 +417,7 @@ def run_dataset_stage(
 
     from config import AgentConfig, PROJECT_ROOT as DATASET_PROJECT_ROOT
     from main import ensure_dependencies, save_agent_logs, setup_logging
+    from tools.runtime import set_runtime_context
 
     load_dotenv(DATASET_PROJECT_ROOT / ".env")
 
@@ -405,16 +435,25 @@ def run_dataset_stage(
     config.logs_root.mkdir(parents=True, exist_ok=True)
     config.artifacts_root.mkdir(parents=True, exist_ok=True)
 
-    os.environ["DATASET_AGENT_DATA_DIR"] = str(config.data_root)
-    os.environ["DATASET_AGENT_LOGS_DIR"] = str(config.logs_root)
-    os.environ["DATASET_AGENT_ARTIFACTS_DIR"] = str(config.artifacts_root)
-    os.environ["DATASET_AGENT_YANDEX_HEADLESS"] = "1" if config.yandex_headless else "0"
-    os.environ["DATASET_AGENT_MANUAL_CAPTCHA_TIMEOUT"] = str(config.yandex_manual_captcha_timeout)
-    if config.yandex_profile_dir:
-        os.environ["DATASET_AGENT_CHROME_PROFILE_DIR"] = config.yandex_profile_dir
+    set_runtime_context(
+        data_root=config.data_root,
+        logs_root=config.logs_root,
+        artifacts_root=config.artifacts_root,
+        yandex_headless=config.yandex_headless,
+        yandex_manual_captcha_timeout=config.yandex_manual_captcha_timeout,
+        yandex_profile_dir=config.yandex_profile_dir,
+    )
 
     log_dir = Path(setup_logging(config, query))
-    os.environ["DATASET_AGENT_RUN_LOG_DIR"] = str(log_dir)
+    set_runtime_context(
+        data_root=config.data_root,
+        logs_root=config.logs_root,
+        artifacts_root=config.artifacts_root,
+        run_log_dir=log_dir,
+        yandex_headless=config.yandex_headless,
+        yandex_manual_captcha_timeout=config.yandex_manual_captcha_timeout,
+        yandex_profile_dir=config.yandex_profile_dir,
+    )
     orchestrator = create_orchestrator(config)
 
     try:
@@ -566,7 +605,7 @@ def run_al_stage(
     human_wait_timeout_sec: float = 86400.0,
     human_poll_interval_sec: float = 5.0,
 ) -> dict[str, Any]:
-    from al_agent.agent import active_learning_op
+    from al_agent.agent import ALAgent
 
     config = {
         "artifacts_dir": str(al_dir),
@@ -583,7 +622,8 @@ def run_al_stage(
         "human_wait_timeout_sec": float(human_wait_timeout_sec),
         "human_poll_interval_sec": float(human_poll_interval_sec),
     }
-    result = active_learning_op(
+    al_agent = ALAgent()
+    result = al_agent.run(
         task_description=task_description,
         labeled_data_path=str(labels_path),
         modality="image",
@@ -611,13 +651,13 @@ def run_al_stage(
             "human_poll_interval_sec": human_poll_interval_sec,
         },
         result=stage_result,
-        agent=None,
+        agent=al_agent,
     )
     stage_result["log_path"] = log_path
     return stage_result
 
 
-def run_three_agent_pipeline(
+def run_four_agent_pipeline(
     *,
     query: str,
     task: str = "image_classification",
@@ -934,7 +974,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    summary = run_three_agent_pipeline(
+    summary = run_four_agent_pipeline(
         query=args.query,
         task=args.task,
         current_run_root=args.current_run_root,

@@ -3,16 +3,13 @@ import sys
 import shutil
 import time
 import json
-import urllib
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
 from tqdm import tqdm
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from fake_headers import Headers
-from requests import PreparedRequest
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import SessionNotCreatedException
@@ -21,51 +18,10 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.common.exceptions import ElementNotInteractableException
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
+from tools.runtime import artifacts_root
 
 
-class Size:
-    def __init__(self):
-        self.large = "large"
-        self.medium = "medium"
-        self.small = "small"
-
-
-class Orientation:
-    def __init__(self):
-        self.horizontal = "horizontal"
-        self.vertical = "vertical"
-        self.square = "square"
-
-
-class ImageType:
-    def __init__(self):
-        self.photo = "photo"
-        self.clipart = "clipart"
-        self.lineart = "lineart"
-        self.face = "face"
-        self.demotivator = "demotivator"
-
-
-class Color:
-    def __init__(self):
-        self.color = "color"
-        self.gray = "gray"
-        self.red = "red"
-        self.orange = "orange"
-        self.yellow = "yellow"
-        self.cyan = "cyan"
-        self.green = "green"
-        self.blue = "blue"
-        self.violet = "violet"
-        self.white = "white"
-        self.black = "black"
-
-
-class Format:
-    def __init__(self):
-        self.jpg = "jpg"
-        self.png = "png"
-        self.gif = "gifan"
+_EMPTY_PAGE_RETRIES = 2
 
 
 class Parser:
@@ -76,12 +32,6 @@ class Parser:
         chromedriver_path=None,
         profile_dir=None,
     ):
-
-        self.size = Size()
-        self.orientation = Orientation()
-        self.type = ImageType()
-        self.color = Color()
-        self.format = Format()
         self.headless = headless
         self.chrome_binary_path = chrome_binary_path or self.__find_chrome_binary()
         self.chromedriver_path = chromedriver_path or self.__find_chromedriver()
@@ -93,11 +43,11 @@ class Parser:
                      limit: int = 100,
                      delay: float = 6.0,
                      manual_captcha_timeout: float = 0.0,
-                     size: Size = None,
-                     orientation: Orientation = None,
-                     image_type: ImageType = None,
-                     color: Color = None,
-                     image_format: Format = None,
+                     size: str = None,
+                     orientation: str = None,
+                     image_type: str = None,
+                     color: str = None,
+                     image_format: str = None,
                      site: str = None) -> list:
         """
         Description
@@ -148,62 +98,6 @@ class Parser:
             manual_captcha_timeout=manual_captcha_timeout,
         )
 
-    def image_search(self,
-                     url: str,
-                     limit: int = 100,
-                     delay: float = 6.0,
-                     manual_captcha_timeout: float = 0.0,
-                     size: Size = None,
-                     orientation: Orientation = None,
-                     color: Color = None,
-                     image_format: Format = None,
-                     site: str = None) -> list:
-        """
-        Description
-        ---------
-        Implements a function for searching for similar images in Yandex Images.
-
-        Параметры
-        ---------
-        **url:** str
-                URL of the image
-        **limit:** int
-                Required (maximum) number of images
-        **delay:** float
-                Delay time between requests (sec)
-        **size:** Size
-                Size (large, small, medium)
-        **orientation:** Orientation
-                Orientation (horizontal, vertical, square)
-        **color:** Color
-                Color scheme (b/w, colored, orange, blue, ... )
-        **image_format:** Format
-                Format (jpg, png, gif)
-        **site:** str
-                The site where the images are located
-
-        Return value
-        ---------
-        list: A list of URL to similar images.
-        """
-
-        params = {"url": url,
-                  "isize": size,
-                  "iorient": orientation,
-                  "icolor": color,
-                  "itype": image_format,
-                  "site": site,
-                  "rpt": "imageview",
-                  "cbir_page": "similar",
-                  "p": 0}
-
-        return self.__get_images(
-            params=params,
-            limit=limit,
-            delay=delay,
-            manual_captcha_timeout=manual_captcha_timeout,
-        )
-
     def __get_images(self, params: dict, limit: int, delay: float, manual_captcha_timeout: float) -> list:
         """
         Description
@@ -225,9 +119,9 @@ class Parser:
         list: A list of URL to images.
         """
 
-        request = self.__prepare_request(params)
+        request_url = self.__build_search_url(params)
         self.last_debug_info = {
-            "request_url": request.url,
+            "request_url": request_url,
             "query_params": params,
             "resolved_urls": 0,
             "driver_title": "",
@@ -265,17 +159,16 @@ class Parser:
             driver = webdriver.Chrome(service=service, options=options)
 
         except SessionNotCreatedException as e:
-            print(f"Error: \033[91mSessionNotCreatedException.\033[0m Chrome/Chromium may not be installed or mismatched with chromedriver. \n\n{e.msg}")
-            raise SystemExit(1)
+            raise RuntimeError(
+                f"Chrome bootstrap failed: {e.msg}"
+            ) from e
         except FileNotFoundError as e:
-            print(f"Error: \033[91mChrome bootstrap failed.\033[0m \n\n{e}")
-            raise SystemExit(1)
+            raise RuntimeError(f"Chrome bootstrap failed: {e}") from e
 
         try:
-            driver.get(request.url)
+            driver.get(request_url)
         except WebDriverException as e:
-            print(f"Error: \033[91mWebDriverException.\033[0m \n\n{e.msg}")
-            raise SystemExit(1)
+            raise RuntimeError(f"WebDriver navigation failed: {e.msg}") from e
 
         images = []
         html = ""
@@ -298,7 +191,7 @@ class Parser:
                 if len(images) == 0:
                     # Give the dynamic page a few extra chances to render results before declaring failure.
                     recovered = False
-                    for _ in range(2):
+                    for _ in range(_EMPTY_PAGE_RETRIES):
                         time.sleep(delay)
                         html = driver.page_source
                         images = self.__parse_html(html)
@@ -322,16 +215,18 @@ class Parser:
 
                 if old_page_height == new_page_height:
                     try:
-                        driver.find_element(By.XPATH, "//div[starts-with(@class, 'FetchListButton')]//button[starts-with(@class, 'Button2')]").click()
+                        button = driver.find_element(
+                            By.XPATH,
+                            "//div[starts-with(@class, 'FetchListButton')]//button[starts-with(@class, 'Button2')]",
+                        )
+                        button.click()
                         time.sleep(delay)
-                    except NoSuchElementException as e:
-                        print(f"Error: {e.msg}")
+                    except NoSuchElementException:
                         break
                     except ElementNotInteractableException:
                         pbar.set_postfix_str("Fewer images found")
                         break
-                    except Exception as e:
-                        print(e)
+                    except Exception:
                         break
         finally:
             if driver is not None:
@@ -385,8 +280,7 @@ class Parser:
         return any(marker in haystack for marker in markers)
 
     def __debug_root(self) -> Path:
-        artifacts_root = os.environ.get("DATASET_AGENT_ARTIFACTS_DIR", "collection_artifacts")
-        return Path(artifacts_root) / "yandex_debug"
+        return artifacts_root() / "yandex_debug"
 
     def __save_debug_snapshot(self, driver, html: str, params: dict) -> dict[str, str]:
         debug_root = self.__debug_root()
@@ -451,31 +345,9 @@ class Parser:
             "chromedriver not found. Set CHROMEDRIVER or install chromedriver inside WSL2."
         )
 
-    def __prepare_request(self, params: dict) -> PreparedRequest:
-        """
-        Description
-        ---------
-        Prepares a GET request to Yandex Images with the received parameters
-        and generated headers.
-
-        Args
-        ---------
-        **params:** dict
-                GET-request parameters.
-
-        Return values
-        ---------
-        PreparedRequest: Prepared GET-request.
-        """
-
-        params = {k: v for k, v in params.items() if v is not None}
-        headers = Headers(headers=True).generate()
-
-        request = requests.Request(method="GET",
-                                   url="https://yandex.ru/images/search",
-                                   params=params,
-                                   headers=headers).prepare()
-        return request
+    def __build_search_url(self, params: dict) -> str:
+        clean_params = {key: value for key, value in params.items() if value is not None}
+        return "https://yandex.ru/images/search?" + urllib.parse.urlencode(clean_params)
 
     def __parse_html(self, html: str) -> list:
         """

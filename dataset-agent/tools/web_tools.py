@@ -8,19 +8,10 @@ from urllib.parse import urljoin
 
 import requests
 from smolagents import tool
-from tools.path_utils import data_root, resolve_data_output_path
+from tools.path_utils import resolve_data_output_path
 
 
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DatasetBot/1.0)"}
-
-
-def _data_root() -> str:
-    return str(data_root())
-
-
-def _resolve_output_path(path: str) -> str:
-    return resolve_data_output_path(path)
-
 
 def _get(url: str, *, stream: bool = False) -> requests.Response:
     response = requests.get(url, headers=DEFAULT_HEADERS, timeout=60, stream=stream)
@@ -115,7 +106,10 @@ def download_file(url: str, save_path: str) -> str:
     Returns:
         A status string with the saved file path and size.
     """
-    target_path = _resolve_output_path(save_path)
+    try:
+        target_path = resolve_data_output_path(save_path)
+    except ValueError as exc:
+        return f"Error: {exc}"
     target_dir = os.path.dirname(target_path) or "."
     os.makedirs(target_dir, exist_ok=True)
 

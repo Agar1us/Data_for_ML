@@ -1,67 +1,65 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
+
+from tools.runtime import data_root as runtime_data_root
+
+
+_LEGACY_RELATIVE_PREFIXES = {
+    ("data",),
+    ("current_run",),
+    ("collection",),
+    ("logs",),
+    ("collection_artifacts",),
+}
+
+
+def _relative_parts(path: str) -> tuple[str, ...]:
+    candidate = Path(path)
+    return tuple(part for part in candidate.parts if part not in {"", "."})
+
+
+def _assert_no_legacy_prefix(parts: tuple[str, ...]) -> None:
+    lowered = tuple(part.casefold() for part in parts)
+    for prefix in _LEGACY_RELATIVE_PREFIXES:
+        prefix_len = len(prefix)
+        if lowered[:prefix_len] == prefix:
+            joined = "/".join(parts)
+            raise ValueError(
+                f"Legacy-relative path prefixes are not allowed: '{joined}'. "
+                "Pass only a path relative to the configured collection root."
+            )
+
+
+def _assert_within_root(target: Path, root: Path) -> Path:
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Path '{resolved}' is outside the configured collection root '{root}'."
+        ) from exc
+    return resolved
 
 
 def data_root() -> Path:
-    return Path(os.getenv("DATASET_AGENT_DATA_DIR", "data")).resolve()
-
-
-def _clean_parts(path: str) -> tuple[str, ...]:
-    parts: list[str] = []
-    for part in Path(os.path.normpath(path)).parts:
-        if part in {"", ".", os.sep}:
-            continue
-        if part == "..":
-            continue
-        parts.append(part)
-    return tuple(parts)
-
-
-def _candidate_prefixes(root: Path) -> list[tuple[str, ...]]:
-    tail = root.parts[-3:] if len(root.parts) >= 3 else root.parts
-    sequences: set[tuple[str, ...]] = {("data",)}
-
-    for start in range(len(tail)):
-        for end in range(start + 1, len(tail) + 1):
-            sequences.add(tuple(tail[start:end]))
-
-    return sorted(sequences, key=len, reverse=True)
-
-
-def _strip_known_prefix(parts: tuple[str, ...], prefixes: list[tuple[str, ...]]) -> tuple[str, ...]:
-    for prefix in prefixes:
-        prefix_len = len(prefix)
-        if prefix_len == 0 or len(parts) < prefix_len:
-            continue
-        for index in range(0, len(parts) - prefix_len + 1):
-            if parts[index : index + prefix_len] == prefix:
-                return parts[index + prefix_len :]
-    return parts
-
-
-def _relative_parts_for_root(path: str, root: Path) -> tuple[str, ...]:
-    if not path or path.strip() in {"", "."}:
-        return ()
-
-    candidate = Path(path)
-    if candidate.is_absolute():
-        candidate = candidate.resolve()
-        try:
-            return candidate.relative_to(root).parts
-        except ValueError:
-            stripped = _strip_known_prefix(_clean_parts(str(candidate)), _candidate_prefixes(root))
-            return stripped[-1:] if stripped == _clean_parts(str(candidate)) else stripped
-
-    return _strip_known_prefix(_clean_parts(path), _candidate_prefixes(root))
+    return runtime_data_root()
 
 
 def resolve_data_output_dir(path: str) -> str:
-    root = data_root()
-    relative_parts = _relative_parts_for_root(path, root)
-    target = root.joinpath(*relative_parts) if relative_parts else root
-    return str(target.resolve())
+    root = runtime_data_root()
+    if not str(path or "").strip():
+        return str(root)
+
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return str(_assert_within_root(candidate, root))
+
+    parts = _relative_parts(path)
+    if any(part == ".." for part in parts):
+        raise ValueError("Parent-directory traversal is not allowed in collection paths.")
+    _assert_no_legacy_prefix(parts)
+    return str(_assert_within_root(root.joinpath(*parts), root))
 
 
 def resolve_data_output_path(path: str) -> str:

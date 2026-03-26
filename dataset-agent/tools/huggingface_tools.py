@@ -4,15 +4,7 @@ import json
 import os
 
 from smolagents import tool
-from tools.path_utils import data_root, resolve_data_output_dir
-
-
-def _data_root() -> str:
-    return str(data_root())
-
-
-def _resolve_output_dir(path: str) -> str:
-    return resolve_data_output_dir(path)
+from tools.path_utils import resolve_data_output_dir
 
 
 @tool
@@ -29,7 +21,7 @@ def search_huggingface(query: str, max_results: int = 10) -> str:
     """
     try:
         from huggingface_hub import list_datasets
-    except Exception as exc:
+    except ImportError as exc:
         return f"Unable to import huggingface_hub: {exc}"
 
     results = []
@@ -76,10 +68,13 @@ def download_hf_dataset(
     """
     try:
         from datasets import load_dataset
-    except Exception as exc:
+    except ImportError as exc:
         return f"Unable to import datasets: {exc}"
 
-    target_dir = _resolve_output_dir(save_dir)
+    try:
+        target_dir = resolve_data_output_dir(save_dir)
+    except ValueError as exc:
+        return f"Error: {exc}"
     os.makedirs(target_dir, exist_ok=True)
 
     kwargs = {"path": dataset_id}
@@ -94,15 +89,24 @@ def download_hf_dataset(
         return f"Error downloading Hugging Face dataset '{dataset_id}': {exc}"
 
     if split:
-        file_path = os.path.join(target_dir, f"{split}.csv")
-        dataset.to_csv(file_path)
-        return f"Downloaded {len(dataset)} records to {file_path}"
+        try:
+            file_path = os.path.join(target_dir, f"{split}.csv")
+            dataset.to_csv(file_path)
+            return f"Downloaded {len(dataset)} records to {file_path}"
+        except Exception:
+            disk_path = os.path.join(target_dir, split)
+            dataset.save_to_disk(disk_path)
+            return f"Downloaded split '{split}' to {disk_path}"
 
     total = 0
     split_names = []
     for split_name, split_dataset in dataset.items():
-        file_path = os.path.join(target_dir, f"{split_name}.csv")
-        split_dataset.to_csv(file_path)
+        try:
+            file_path = os.path.join(target_dir, f"{split_name}.csv")
+            split_dataset.to_csv(file_path)
+        except Exception:
+            file_path = os.path.join(target_dir, split_name)
+            split_dataset.save_to_disk(file_path)
         total += len(split_dataset)
         split_names.append(split_name)
     return f"Downloaded {total} records ({split_names} splits) to {target_dir}"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -23,34 +23,11 @@ class AgentConfig:
     logs_dir: str = "data/current_run/logs"
     artifacts_dir: str = "data/current_run/collection_artifacts"
     max_dataset_size_gb: float = 5.0
-    max_images_per_query: int = 10000
-    max_records_per_query: int = 10000
 
     # Parsing
-    request_delay_sec: float = 2.0
-    request_timeout_sec: float = 30.0
-    yandex_parser_delay: float = 6.0
     yandex_headless: bool = True
     yandex_profile_dir: str = ""
     yandex_manual_captcha_timeout: float = 0.0
-
-    # Imports allowed for CodeAgent
-    authorized_imports: list[str] = field(
-        default_factory=lambda: [
-            "requests",
-            "bs4",
-            "json",
-            "csv",
-            "os",
-            "pathlib",
-            "pandas",
-            "re",
-            "time",
-            "urllib",
-            "hashlib",
-            "datetime",
-        ]
-    )
 
     def resolve_dir(self, value: str) -> Path:
         path = Path(value)

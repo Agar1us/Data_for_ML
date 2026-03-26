@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover - import fallback for static analysis en
 from annotation_agent.config import (
     AL_HUMAN_LABELS_FILE_NAME,
     AL_LABELS_FILE_NAME,
+    COLUMN_FOLDER_LABEL,
     DEFAULT_ARTIFACTS_DIR,
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_LABEL_ASSIGNMENT_MODE,
@@ -268,15 +270,21 @@ class AnnotationAgent:
         finally:
             if labeled_csv.exists():
                 labeled_csv.unlink()
+        labelstudio_config_path = run_dir / "reports" / "labelstudio_config.xml"
+        labelstudio_config_path.write_text(
+            self._build_labelstudio_config(self.classes or self._infer_classes_from_runtime()),
+            encoding="utf-8",
+        )
         result = {
             "run_dir": str(run_dir),
             "labelstudio_import_json": str(export["output_path"]),
             "labelstudio_review_json": str(export["review_output_path"]),
+            "labelstudio_config_xml": str(labelstudio_config_path),
             "labelstudio_document_root": str(export["local_files_document_root"]),
             "object_prompts": resolved.object_prompts or self.object_prompts,
             "label_assignment_mode": resolved.label_assignment_mode or self.label_assignment_mode,
         }
-        self._require_paths(result, ["labelstudio_import_json", "labelstudio_review_json"])
+        self._require_paths(result, ["labelstudio_import_json", "labelstudio_review_json", "labelstudio_config_xml"])
         self._remember_run(result)
         self.last_result = result
         return result
@@ -317,6 +325,7 @@ class AnnotationAgent:
             "quality_metrics_json": quality["quality_metrics_json"],
             "labelstudio_import_json": exports["labelstudio_import_json"],
             "labelstudio_review_json": exports["labelstudio_review_json"],
+            "labelstudio_config_xml": exports["labelstudio_config_xml"],
             "classes": self.classes or [],
             "object_prompts": context.object_prompts or self.object_prompts,
             "label_assignment_mode": context.label_assignment_mode or self.label_assignment_mode,
@@ -330,6 +339,7 @@ class AnnotationAgent:
                 "quality_metrics_json",
                 "labelstudio_import_json",
                 "labelstudio_review_json",
+                "labelstudio_config_xml",
             ],
         )
         self._remember_run(result)
@@ -352,6 +362,23 @@ class AnnotationAgent:
             planning_interval=1,
             max_steps=4,
             verbosity_level=1,
+        )
+
+    def _infer_classes_from_runtime(self) -> list[str]:
+        if self.last_labeled_df is None or COLUMN_FOLDER_LABEL not in self.last_labeled_df.columns:
+            return []
+        return sorted({str(value).strip() for value in self.last_labeled_df[COLUMN_FOLDER_LABEL].dropna().tolist() if str(value).strip()})
+
+    @staticmethod
+    def _build_labelstudio_config(classes: list[str]) -> str:
+        labels = "\n".join(f'    <Label value="{escape(class_name, quote=True)}"/>' for class_name in classes if class_name)
+        return (
+            "<View>\n"
+            '  <Image name="image" value="$image" zoom="true"/>\n'
+            '  <RectangleLabels name="label" toName="image">\n'
+            f"{labels}\n"
+            "  </RectangleLabels>\n"
+            "</View>\n"
         )
 
     def _generate_spec_with_agent(self, task: str, summary_path: Path, summary: ToolResult, output_path: Path) -> ToolResult:
