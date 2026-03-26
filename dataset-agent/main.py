@@ -155,6 +155,7 @@ def main() -> int:
     print("-" * 60)
 
     log_dir = setup_logging(config, args.query)
+    os.environ["DATASET_AGENT_RUN_LOG_DIR"] = log_dir
     orchestrator = create_orchestrator(config)
 
     try:

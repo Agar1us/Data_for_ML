@@ -29,18 +29,31 @@ def _openai_token_kwargs(config: Any) -> dict[str, Any]:
     return {"max_tokens": max_tokens}
 
 
+class _SerialToolOpenAIModelMixin:
+    def _prepare_completion_kwargs(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        completion_kwargs = super()._prepare_completion_kwargs(*args, **kwargs)
+        if "tools" in completion_kwargs:
+            completion_kwargs["parallel_tool_calls"] = False
+        else:
+            completion_kwargs.pop("parallel_tool_calls", None)
+        return completion_kwargs
+
+
 def create_openai_model(config: Any) -> Any:
     from smolagents import OpenAIModel
 
+    class DatasetOpenAIModel(_SerialToolOpenAIModelMixin, OpenAIModel):
+        pass
+
     kwargs = _supported_kwargs(
-        OpenAIModel,
+        DatasetOpenAIModel,
         {
             "model_id": config.model_id,
             "temperature": config.temperature,
             **_openai_token_kwargs(config),
         },
     )
-    return OpenAIModel(**kwargs)
+    return DatasetOpenAIModel(**kwargs)
 
 
 def create_toolcalling_agent(
@@ -55,6 +68,7 @@ def create_toolcalling_agent(
     max_steps: int | None = None,
     planning_interval: int | None = None,
     verbosity_level: int = 2,
+    max_tool_threads: int = 1,
 ) -> Any:
     from smolagents import ToolCallingAgent
 
@@ -68,5 +82,6 @@ def create_toolcalling_agent(
         "planning_interval": planning_interval,
         "verbosity_level": verbosity_level,
         "instructions": instructions,
+        "max_tool_threads": max_tool_threads,
     }
     return ToolCallingAgent(**_supported_kwargs(ToolCallingAgent, kwargs))

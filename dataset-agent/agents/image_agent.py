@@ -11,7 +11,14 @@ Rules:
 - Use only the provided tools.
 - Do not write custom scraping code when the Yandex Images tool already covers the request.
 - If the user explicitly requests Yandex Images, work directly with search_and_download_images.
+- Never emit multiple tool calls in one assistant turn.
+- Execute search_and_download_images sequentially: exactly one tool call, then wait for the observation, then decide the next call.
 - For class-based image collection, call search_and_download_images at most once per class/query in a run.
+- Do not launch multiple queries for the same class in parallel.
+- Keep search queries short and concrete: at most 5 words per query.
+- Track cumulative downloaded counts per class from prior observations.
+- If a class already reached the requested target count for the task, stop issuing new queries for that class.
+- If one successful query already reaches or exceeds the target count for a class, do not run fallback queries for that class.
 - Save all downloaded files under the configured collection root, not under a separate top-level data tree.
 - When save_dir points to a class folder, store downloaded files under save_dir/<query_slug>/ so multiple queries for one class stay separated.
 - If save_dir includes an intermediate 'originals' folder, normalize it away so the final dataset root is collection/<dataset_name>/<class>/<query_slug>/.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -83,6 +84,19 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _append_tool_log(record: dict) -> None:
+    log_dir = (
+        os.environ.get("DATASET_AGENT_RUN_LOG_DIR", "").strip()
+        or os.environ.get("DATASET_AGENT_LOGS_DIR", "").strip()
+    )
+    if not log_dir:
+        return
+    log_path = Path(log_dir) / "yandex_image_tool_log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 @tool
 def search_and_download_images(
     query: str,
@@ -133,7 +147,26 @@ def search_and_download_images(
         effective_profile_dir,
     )
     if key in _SEARCH_CALL_CACHE:
-        return _SEARCH_CALL_CACHE[key]
+        cached_result = _SEARCH_CALL_CACHE[key]
+        try:
+            cached_payload = json.loads(cached_result)
+        except json.JSONDecodeError:
+            cached_payload = {"raw_result": cached_result}
+        _append_tool_log(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "tool": "search_and_download_images",
+                "cache_hit": True,
+                "query": query,
+                "requested_limit": int(limit),
+                "save_dir": resolve_data_output_dir(save_dir),
+                "resolved_save_dir": resolved_save_dir,
+                "headless": bool(effective_headless),
+                "profile_dir": effective_profile_dir,
+                "result": cached_payload,
+            }
+        )
+        return cached_result
 
     parser = Parser(
         headless=effective_headless,
@@ -151,6 +184,7 @@ def search_and_download_images(
     os.makedirs(resolved_save_dir, exist_ok=True)
     downloaded = 0
     failed = 0
+    failure_details: list[dict[str, str | int]] = []
 
     headers = {"User-Agent": "Mozilla/5.0 (compatible; DatasetBot/1.0)"}
     for index, url in enumerate(urls):
@@ -162,8 +196,20 @@ def search_and_download_images(
             with open(file_path, "wb") as handle:
                 handle.write(response.content)
             downloaded += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
+            failure_record: dict[str, str | int] = {
+                "index": int(index),
+                "url": url,
+                "error": type(exc).__name__,
+                "message": str(exc),
+            }
+            if hasattr(exc, "response") and getattr(exc, "response", None) is not None:
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
+                if status_code is not None:
+                    failure_record["status_code"] = int(status_code)
+            failure_details.append(failure_record)
 
     status = "ok"
     completed = True
@@ -204,6 +250,7 @@ def search_and_download_images(
         "resolved_urls": int(len(urls)),
         "downloaded": int(downloaded),
         "failed": int(failed),
+        "failed_downloads": failure_details,
         "driver_title": parser.last_debug_info.get("driver_title", ""),
         "driver_url": parser.last_debug_info.get("driver_url", ""),
         "debug_html_path": parser.last_debug_info.get("debug_html_path", ""),
@@ -224,6 +271,20 @@ def search_and_download_images(
         ),
     }
     result = json.dumps(payload, ensure_ascii=False)
+    _append_tool_log(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tool": "search_and_download_images",
+            "cache_hit": False,
+            "query": query,
+            "requested_limit": int(limit),
+            "save_dir": resolve_data_output_dir(save_dir),
+            "resolved_save_dir": resolved_save_dir,
+            "headless": bool(effective_headless),
+            "profile_dir": effective_profile_dir,
+            "result": payload,
+        }
+    )
     if urls and status == "ok":
         _SEARCH_CALL_CACHE[key] = result
     return result

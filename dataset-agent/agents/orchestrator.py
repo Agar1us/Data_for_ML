@@ -25,6 +25,8 @@ Workflow:
 
 Rules:
 - Use only the provided tools and managed agents for downloads, parsing, and saving whenever a suitable tool already exists.
+- Never emit multiple tool calls in one assistant turn.
+- Delegate to at most one managed agent per assistant turn, then wait for the observation before making the next decision.
 - Always keep source outputs under the configured collection root, not under ad-hoc top-level paths.
 - Treat any path like data/<dataset_name>/... from the user or your own plan as a logical dataset name under the configured collection root.
 - For image classification datasets, preserve one subdirectory per class under the dataset root.

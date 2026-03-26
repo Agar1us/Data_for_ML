@@ -212,13 +212,37 @@ def _normalize_prompt_list(value: Any) -> list[str]:
     return []
 
 
+def _extract_prompt_list_from_text(result_text: str, field_name: str) -> list[str]:
+    pattern = rf"{field_name}\s*:\s*(.+)"
+    match = re.search(pattern, result_text, flags=re.IGNORECASE)
+    if not match:
+        return []
+
+    raw_value = match.group(1).strip()
+    if "\n" in raw_value:
+        raw_value = raw_value.splitlines()[0].strip()
+    raw_value = raw_value.lstrip("-").strip()
+    if not raw_value:
+        return []
+
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        parsed = raw_value.strip("\"'")
+
+    return _normalize_prompt_list(parsed)
+
+
 def _extract_object_prompts_from_dataset_result(result: Any) -> list[str]:
     payload = result
     if isinstance(result, str):
         try:
             payload = json.loads(result)
         except json.JSONDecodeError:
-            return []
+            prompts = _extract_prompt_list_from_text(result, "object_prompts")
+            if prompts:
+                return prompts
+            return _extract_prompt_list_from_text(result, "object_prompt")
     if not isinstance(payload, dict):
         return []
     prompts = _normalize_prompt_list(payload.get("object_prompts"))
@@ -390,6 +414,7 @@ def run_dataset_stage(
         os.environ["DATASET_AGENT_CHROME_PROFILE_DIR"] = config.yandex_profile_dir
 
     log_dir = Path(setup_logging(config, query))
+    os.environ["DATASET_AGENT_RUN_LOG_DIR"] = str(log_dir)
     orchestrator = create_orchestrator(config)
 
     try:
@@ -627,7 +652,8 @@ def run_three_agent_pipeline(
     directories = _ensure_current_run_dirs(root)
     before_snapshot = snapshot_image_datasets(directories["collection_dir"]) if "dataset" in selected_stages else {}
     pipeline_log_dir = directories["logs_dir"] / _make_log_dir_name(query)
-    pipeline_log_dir.mkdir(parents=True, exist_ok=True)
+    if "dataset" not in selected_stages:
+        pipeline_log_dir.mkdir(parents=True, exist_ok=True)
 
     dataset_stage: dict[str, Any]
     if "dataset" in selected_stages:
@@ -639,6 +665,7 @@ def run_three_agent_pipeline(
             max_results=dataset_max_results,
         )
         dataset_log_dir = Path(str(dataset_stage.get("log_dir") or pipeline_log_dir))
+        dataset_log_dir.mkdir(parents=True, exist_ok=True)
         pipeline_log_dir = dataset_log_dir
         dataset_dir = discover_latest_image_dataset(directories["collection_dir"], before_snapshot=before_snapshot)
     else:
