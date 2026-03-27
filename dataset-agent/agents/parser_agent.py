@@ -38,10 +38,6 @@ def create_parser_agent(model, config):
             "mistakenly delegated here for those sources."
         ),
         tools=[
-            search_huggingface,
-            download_hf_dataset,
-            search_kaggle,
-            download_kaggle_dataset,
             fetch_page,
             extract_table_from_html,
             extract_links_from_page,
